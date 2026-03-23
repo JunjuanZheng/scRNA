@@ -1,1282 +1,894 @@
-# -*- coding: UTF-8 -*-  
-library(dplyr)  
-library(ggplot2)  
-library(patchwork)  
-library(Seurat)  
-library(clustree)  # 用于评估聚类稳定性  
+# -*- coding: UTF-8 -*-
+# ============================================================
+# 单细胞 RNA-seq 完整 QC Pipeline
+# 包含：空细胞检测 -> 环境RNA去除 -> QC指标(mt+Hb) ->
+#       保存原始 -> QC过滤 -> 保存过滤后 -> DoubletFinder -> 合并
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(Seurat)
+library(clustree)
 library(DoubletFinder)
-library(clustree)  
-library(igraph)  
-library(cluster)  
+library(igraph)
+library(cluster)
 library(bluster)
 library(SeuratWrappers)
-# 设置工作目录  
-projectPath <- "/mnt2/wanggd_group/zjj/BGCscRNA/WangHuishan/PJ23062901422"  
-setwd(projectPath)  
+library(DropletUtils)
+library(SoupX)
+library(celda)
+library(scater)
+library(SingleCellExperiment)
 
-##### 1.数据导入并创建seurat对象 #####  
+# ============================================================
+# 全局参数设置
+# ============================================================
+set.seed(42)
 
-# 获取数据文件夹下的所有样本文件列表  
-samples <- list.files(paste0(projectPath, "/Data/QuantifyRawdata/"))  
-seurat_list <- list()  
-sample_ids <- c()  # 改为向量而不是列表  
+projectPath <- "/mnt2/wanggd_group/zjj/ZengMin20260310"
+setwd(projectPath)
 
-# 读取每个样本的10x数据并创建Seurat对象  
-for (sample in samples) {  
-  tryCatch({  
-    # 拼接文件路径  
-    data.path <- file.path(projectPath, "/Data/QuantifyRawdata", sample,   
-                           paste0(sample, "_outs"), "filtered_cell_gene_matrix")  
-    
-    # 检查路径是否存在  
-    if (!dir.exists(data.path)) {  
-      warning(paste("Directory not found:", data.path))  
-      next  
-    }  
-    # 读取数据  
-    seurat_data<-Read10X(data.dir = data.path)  
-    # 提取样本ID  
-    sample_id <- sample  
-    
-    # 创建Seurat对象  
-    seurat_obj <- CreateSeuratObject(counts = seurat_data,  
-                                    project = sample_id,  
-                                    min.features = 0,  
-                                    min.cells = 0) 
-								
-	seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt-")
+# 确保输出目录存在
+dir.create(file.path(projectPath, "Output"),               showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(projectPath, "Output", "EmptyDrops"),  showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(projectPath, "Output", "AmbientRNA"),  showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(projectPath, "Output", "DoubletFinder"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(projectPath, "Output", "CellCycle"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(projectPath, "Data"),                  showWarnings = FALSE, recursive = TRUE)
 
-    vln_plot_nCount <- VlnPlot(seurat_obj, features = "nCount_RNA", pt.size = 0) + 
-    ggtitle("nCount")
+# ---- 动态日期标签（格式：YYMMDD） ----
+date_tag <- format(Sys.Date(), "%y%m%d")
+message(sprintf("Date tag: %s", date_tag))
 
-    vln_plot_nFeature <- VlnPlot(seurat_obj, features = "nFeature_RNA", pt.size = 0) + 
-    ggtitle("nFeature")
+# ---- QC 阈值（集中管理） ----
+MIN_FEATURES   <- 200
+MAX_FEATURES   <- 5000
+MAX_MT_PERCENT <- 20
+MAX_HB_PERCENT <- 5
+MIN_COUNTS     <- 500
+PC_DIMS        <- 1:20
+MIN_NOVELTY    <- 0.8  # 作为示例阈值
 
-    vln_plot_percent_mt <- VlnPlot(seurat_obj, features = "percent.mt", pt.size = 0) + 
-    ggtitle("percent.mt")
+# ---- 物种相关 Pattern ----
+# 小鼠: mt -> "^mt-",  Hb -> "^Hb[ab]-"
+MT_PATTERN <- "^MT-"     # 如犬/其他需自行调整
+HB_PATTERN <- "^HBA|^HBB"
 
-    # 将小提琴图组合起来显示
-    combined_vln_plot <- vln_plot_nCount | vln_plot_nFeature | vln_plot_percent_mt
-	# 保存小提琴图到文件
-    output_file <- file.path(projectPath, "Output", paste0(sample,".nFeature_nCount_percent_mt.ViolinPlots.png"))
-    ggsave(output_file, plot = combined_vln_plot, width = 12, height = 12, dpi = 300)
-    # 提示保存成功
-    message(paste("Violin plots saved to:", output_file))
-	
-    # 将Seurat对象添加到列表中  
-    seurat_list[[sample_id]] <- seurat_obj  
-    sample_ids <- c(sample_ids, sample_id)  
-    
-  }, error = function(e) {  
-    message(paste("Error processing sample:", sample))  
-    message(e)  
-  })  
-}  
+# ---- EmptyDrops 参数 ----
+EMPTY_DROPS_FDR   <- 0.01
+EMPTY_DROPS_LOWER <- 100
 
-# 保存初始对象  
-save(seurat_list,   
-    file = file.path(projectPath, "Data", "01_2021216_4Samples_ObjectOriginal.Rdata"))  
+# ---- DecontX 参数 ----
+DECONTX_CONTAMINATION_THRESHOLD <- 0.5
 
-load(file.path(projectPath, "Data", "2021216_4Samples_ObjectOriginal.Rdata"))
-# 创建marker_list并设置PDF输出  
-marker_list <- list()  
-#clustree_pdf <- file.path(projectPath, "Output", "Clustree_Plots.pdf") 
-#pdf(clustree_pdf, width = 12, height = 12)
- 
-umap_pdf <- file.path(projectPath, "Output", "All_doubletFinderPlots_.pdf")  
-pdf(umap_pdf, width = 10, height = 8) 
-# 创建双细胞检测结果目录
-#doublet_dir <- file.path(projectPath, "Output/DoubletFinder")
-#dir.create(doublet_dir, showWarnings = FALSE, recursive = TRUE)
-#pdf(file.path(doublet_dir, paste0("20250220_45Samples_CanPBMC_Object_doublets.pdf")), width = 10, height = 8)
+# ---- 动态文件名生成函数 ----
+make_filename <- function(n_samples, suffix, prefix = "", ext = "Rdata") {
+  fname <- paste0(prefix, date_tag, "_", n_samples, "Samples_", suffix, ".", ext)
+  return(fname)
+}
 
-# 处理每个样本 
-for (i in seq_along(seurat_list)) { 
-  obj_name <- names(seurat_list)[i]  
-  current_obj <- seurat_list[[obj_name]]  
+# ============================================================
+# 读取 Cell Ranger 的初始细胞数（若有）
+# 这里实现一个健壮函数，尽量从 outs/stats.txt 或 metrics.json 获取
+# 返回整数或 NA
+get_cellranger_cells <- function(sample_dir) {
+  # 假设 sample_dir 指向 Data/QuantifyRawdata/样本名
+  # 常见的 stats 文件路径：
+  # outs/stats.txt 或 outs/metrics.json
+  stats_path1 <- file.path(sample_dir, "outs", "stats.txt")
+  metrics_path <- file.path(sample_dir, "outs", "metrics.json")
+  n_cells <- NA
+
+  if (file.exists(stats_path1)) {
+    # 尝试读取 stats.txt, 找到包含 "number of reads" 或 "reads" 的行，需要看实际文件
+    stat_lines <- readLines(stats_path1, warn = FALSE)
+    # 常见字段：" Peanut": 不同版本可能不同，请尝试匹配 "nCells"、"cell barcodes"、"nGenes"
+    # 尝试解析常见字段
+    # 直接搜索包含 "Total Cells" 或 "Cells"
+    tc_line <- grep("Total Cells|Total\\s+Cells|Cells", stat_lines, value = TRUE)
+    if (length(tc_line) > 0) {
+      # 从行中提取数字
+      nums <- as.numeric(gsub("[^0-9]", "", tc_line[1]))
+      if (!is.na(nums) && length(nums) > 0) n_cells <- nums
+    }
+  }
+
+  if (is.na(n_cells) && file.exists(metrics_path)) {
+    # 读取 json
+    json <- tryCatch(jsonlite::read_json(metrics_path), error = function(e) NULL)
+    if (!is.null(json)) {
+      if (!is.null(json$summary) && !is.null(json$summary$nCells)) {
+        n_cells <- as.numeric(json$summary$nCells)
+      } else if (!is.null(json$nCells)) {
+        n_cells <- as.numeric(json$nCells)
+      }
+    }
+  }
+
+  # 回退：尝试在 outs 目录下的其他可能文件
+  if (is.na(n_cells)) {
+    alt <- file.path(sample_dir, "outs", "cell_barcodes.tsv")
+    if (file.exists(alt)) {
+      n_cells <- length(readLines(alt))
+    }
+  }
+
+  return(as.integer(n_cells))
+}
+
+# ============================================================
+# 1. 数据导入 + 空细胞检测 + 环境 RNA 去除 + QC 指标计算
+# ============================================================
+samples <- list.files(file.path(projectPath, "Data", "QuantifyRawdata"))
+
+seurat_list_raw      <- list()   # 过滤前
+seurat_list_filtered <- list()   # 过滤后
+sample_ids           <- c()
+qc_summary           <- list()
+
+for (sample in samples) {
+  tryCatch({
+    message(paste("\n========================================"))
+    message(paste("Processing sample:", sample))
+    message(paste("========================================"))
+
+    # ---------- 路径设置 ----------
+    base_path     <- file.path(projectPath, "Data", "QuantifyRawdata", sample)
+    filtered_path <- file.path(base_path, "filtered_cell_gene_matrix")
+    raw_path      <- file.path(base_path, "raw_cell_gene_matrix")
+
+    if (!dir.exists(filtered_path)) {
+      warning(paste("Filtered matrix not found:", filtered_path))
+      next
+    }
+
+    has_raw <- dir.exists(raw_path)
+    message(sprintf("  Raw matrix available: %s", has_raw))
+
+    # ---------- 读取数据 ----------
+    filtered_data <- Read10X(data.dir = filtered_path)
+    if (has_raw) {
+      raw_data <- Read10X(data.dir = raw_path)
+    }
+
+    # ==========================================================
+    # 步骤 A：空细胞率检测（EmptyDrops）
+    # ==========================================================
+    if (has_raw) {
+      message("  Running emptyDrops on raw matrix...")
+
+      set.seed(42)
+      e.out <- emptyDrops(raw_data, lower = EMPTY_DROPS_LOWER)
+
+      is_cell          <- e.out$FDR <= EMPTY_DROPS_FDR & !is.na(e.out$FDR)
+      n_empty          <- sum(!is_cell, na.rm = TRUE)
+      n_real_cells     <- sum(is_cell, na.rm = TRUE)
+      n_total_barcodes <- nrow(e.out)
+      empty_rate       <- round((1 - n_real_cells / n_total_barcodes) * 100, 2)
+
+      message(sprintf("  EmptyDrops: %d total barcodes, %d real cells, %.2f%% empty",
+                      n_total_barcodes, n_real_cells, empty_rate))
+
+      # 诊断图
+      ed_df <- data.frame(
+        total_UMI     = e.out$Total,
+        neg_log10_FDR = -log10(e.out$FDR),
+        is_cell       = is_cell
+      )
+      ed_df <- ed_df[!is.na(ed_df$neg_log10_FDR), ]
+
+      p_empty <- ggplot(ed_df, aes(x = total_UMI, y = neg_log10_FDR, color = is_cell)) +
+        geom_point(size = 0.3, alpha = 0.5) +
+        scale_x_log10() +
+        scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "gray70"),
+                           labels = c("TRUE" = "Cell", "FALSE" = "Empty"),
+                           name   = "Classification") +
+        geom_hline(yintercept = -log10(EMPTY_DROPS_FDR), linetype = "dashed", color = "red") +
+        theme_classic() +
+        labs(title    = paste0(sample, ": EmptyDrops Detection"),
+             subtitle = paste0("Real cells: ", n_real_cells, "  |  Empty rate: ", empty_rate, "%"),
+             x = "Total UMI (log10)", y = "-log10(FDR)")
+      ggsave(file.path(projectPath, "Output", "EmptyDrops",
+                       paste0(sample, "_emptyDrops.png")),
+             plot = p_empty, width = 8, height = 6, dpi = 300)
+
+      real_cell_barcodes <- rownames(e.out)[is_cell]
+      common_barcodes    <- intersect(colnames(filtered_data), real_cell_barcodes)
+      filtered_data      <- filtered_data[, common_barcodes]
+
+      message(sprintf("  After emptyDrops: %d cells retained", ncol(filtered_data)))
+
+    } else {
+      message("  No raw matrix. Using UMI threshold for empty cell filtering.")
+
+      col_sums     <- Matrix::colSums(filtered_data)
+      n_before     <- ncol(filtered_data)
+      keep_cells   <- col_sums >= EMPTY_DROPS_LOWER
+      n_empty_like <- sum(!keep_cells)
+      empty_rate   <- round(n_empty_like / n_before * 100, 2)
+
+      sorted_umi <- sort(col_sums, decreasing = TRUE)
+      knee_df    <- data.frame(rank = seq_along(sorted_umi), UMI = sorted_umi)
+
+      p_knee <- ggplot(knee_df, aes(x = rank, y = UMI)) +
+        geom_line(color = "steelblue") +
+        scale_x_log10() + scale_y_log10() +
+        geom_hline(yintercept = EMPTY_DROPS_LOWER, linetype = "dashed", color = "red") +
+        annotate("text", x = max(knee_df$rank) * 0.5, y = EMPTY_DROPS_LOWER * 2,
+                 label = paste0("Threshold: ", EMPTY_DROPS_LOWER, " UMI"),
+                 color = "red", size = 4) +
+        theme_classic() +
+        labs(title    = paste0(sample, ": Barcode Rank Plot"),
+             subtitle = paste0("Removed: ", n_empty_like, "  |  Empty-like rate: ", empty_rate, "%"),
+             x = "Barcode Rank (log10)", y = "Total UMI (log10)")
+      ggsave(file.path(projectPath, "Output", "EmptyDrops",
+                       paste0(sample, "_kneePlot.png")),
+             plot = p_knee, width = 8, height = 6, dpi = 300)
+
+      filtered_data    <- filtered_data[, keep_cells]
+      n_real_cells     <- ncol(filtered_data)
+      n_total_barcodes <- n_before
+      message(sprintf("  After UMI threshold: %d -> %d cells", n_before, n_real_cells))
+    }
+
+    # ==========================================================
+    # 步骤 B：环境 RNA 污染估算与去除
+    # ==========================================================
+    if (has_raw) {
+      # ---- 方案 A：SoupX ----
+      message("  Running SoupX...")
+
+      temp_obj <- CreateSeuratObject(counts = filtered_data, project = sample) %>%
+        NormalizeData(verbose = FALSE) %>%
+        FindVariableFeatures(verbose = FALSE) %>%
+        ScaleData(verbose = FALSE) %>%
+        RunPCA(verbose = FALSE, seed.use = 42) %>%
+        FindNeighbors(dims = 1:20, verbose = FALSE) %>%
+        FindClusters(resolution = 0.8, verbose = FALSE) %>%
+        RunUMAP(dims = 1:20, verbose = FALSE, seed.use = 42)
+
+      sc       <- SoupChannel(tod = raw_data, toc = filtered_data)
+      clusters <- setNames(as.character(Idents(temp_obj)), colnames(temp_obj))
+      sc       <- setClusters(sc, clusters)
+      sc       <- setDR(sc, Embeddings(temp_obj, "umap"), reductName = "UMAP")
+      sc       <- autoEstCont(sc, verbose = FALSE)
+
+      contamination_fraction <- sc$fit$rhoEst
+      mean_contamination     <- contamination_fraction
+      message(sprintf("  SoupX contamination: %.4f (%.2f%%)",
+                      contamination_fraction, contamination_fraction * 100))
+
+      corrected_counts <- adjustCounts(sc)
+
+      # SoupX 诊断图
+      png(file.path(projectPath, "Output", "AmbientRNA",
+                    paste0(sample, "_SoupX_diagnostics.png")),
+          width = 1200, height = 800, res = 150)
+      top_genes     <- head(sort(Matrix::rowSums(filtered_data), decreasing = TRUE), 6)
+      top_gene_name <- names(top_genes)[1]
+      if (!is.null(top_gene_name)) {
+        tryCatch(plotChangeMap(sc, geneSet = top_gene_name, DR = "UMAP"),
+                 error = function(e) message("  SoupX plotChangeMap failed: ", conditionMessage(e)))
+      }
+      dev.off()
+
+      seurat_obj <- CreateSeuratObject(counts = corrected_counts, project = sample,
+                                       min.features = 0, min.cells = 0)
+      seurat_obj$ambient_contamination <- contamination_fraction
+      seurat_obj$ambient_method        <- "SoupX"
+
+      rm(temp_obj, sc); gc()
+
+    } else {
+      # ---- 方案 B：DecontX ----
+      message("  Running DecontX...")
+
+      sce <- SingleCellExperiment(assays = list(counts = filtered_data))
+      set.seed(42)
+      sce <- decontX(sce)
+
+      contamination_scores <- colData(sce)$decontX_contamination
+      mean_contamination   <- mean(contamination_scores, na.rm = TRUE)
+      median_contamination <- median(contamination_scores, na.rm = TRUE)
+
+      message(sprintf("  DecontX - Mean: %.2f%%, Median: %.2f%%",
+                      mean_contamination * 100, median_contamination * 100))
+
+      # 污染分布直方图
+      contam_df <- data.frame(contamination = contamination_scores)
+      p_contam <- ggplot(contam_df, aes(x = contamination)) +
+        geom_histogram(bins = 50, fill = "steelblue", color = "white", alpha = 0.8) +
+        geom_vline(xintercept = mean_contamination, linetype = "dashed", color = "red", linewidth = 1) +
+        geom_vline(xintercept = DECONTX_CONTAMINATION_THRESHOLD,
+                   linetype = "dotted", color = "darkred", linewidth = 1) +
+        annotate("text", x = mean_contamination + 0.05, y = Inf,
+                 label = paste0("Mean: ", round(mean_contamination * 100, 1), "%"),
+                 vjust = 2, color = "red", size = 4) +
+        annotate("text", x = DECONTX_CONTAMINATION_THRESHOLD + 0.05, y = Inf,
+                 label = paste0("Threshold: ", DECONTX_CONTAMINATION_THRESHOLD * 100, "%"),
+                 vjust = 4, color = "darkred", size = 3.5) +
+        theme_classic() +
+        labs(title = paste0(sample, ": DecontX Contamination Distribution"),
+             x = "Contamination Fraction", y = "Number of Cells")
+      ggsave(file.path(projectPath, "Output", "AmbientRNA",
+                       paste0(sample, "_DecontX_contamination_hist.png")),
+             plot = p_contam, width = 8, height = 6, dpi = 300)
+
+      # UMAP 上展示污染
+      sce <- scater::runPCA(sce, exprs_values = "decontXcounts", seed = 42)
+      sce <- scater::runUMAP(sce, dimred = "PCA")
+
+      umap_df <- data.frame(
+        UMAP1         = reducedDim(sce, "UMAP")[, 1],
+        UMAP2         = reducedDim(sce, "UMAP")[, 2],
+        contamination = contamination_scores
+      )
+      p_umap_contam <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = contamination)) +
+        geom_point(size = 0.3, alpha = 0.6) +
+        scale_color_viridis_c(option = "inferno", direction = -1, name = "Contamination") +
+        theme_classic() +
+        labs(title = paste0(sample, ": DecontX Contamination on UMAP"))
+      ggsave(file.path(projectPath, "Output", "AmbientRNA",
+                       paste0(sample, "_DecontX_UMAP.png")),
+             plot = p_umap_contam, width = 9, height = 7, dpi = 300)
+
+      corrected_counts <- decontXcounts(sce)
+
+      seurat_obj <- CreateSeuratObject(counts = corrected_counts, project = sample,
+                                       min.features = 0, min.cells = 0)
+      seurat_obj$ambient_contamination <- contamination_scores
+      seurat_obj$ambient_method        <- "DecontX"
+      seurat_obj$high_contamination    <- contamination_scores > DECONTX_CONTAMINATION_THRESHOLD
+
+      n_high_contam <- sum(seurat_obj$high_contamination)
+      message(sprintf("  High contamination cells (>%.0f%%): %d (%.2f%%)",
+                      DECONTX_CONTAMINATION_THRESHOLD * 100,
+                      n_high_contam, n_high_contam / ncol(seurat_obj) * 100))
+
+      rm(sce); gc()
+    }
+
+    # ==========================================================
+    # 步骤 C：计算 QC 指标（mt + Hb）
+    # ==========================================================
+    seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = MT_PATTERN)
+    seurat_obj[["percent.hb"]] <- PercentageFeatureSet(seurat_obj, pattern = HB_PATTERN)
+
+    # Hb 基因是否匹配
+    hb_genes_found <- grep(HB_PATTERN, rownames(seurat_obj), value = TRUE)
+    mt_genes_found <- grep(MT_PATTERN, rownames(seurat_obj), value = TRUE)
+    message(sprintf("  MT genes matched: %d (%s)", length(mt_genes_found),
+                    paste(head(mt_genes_found, 5), collapse = ", ")))
+    message(sprintf("  Hb genes matched: %d (%s)", length(hb_genes_found),
+                    paste(head(hb_genes_found, 5), collapse = ", ")))
+    if (length(hb_genes_found) == 0) {
+      warning("  No Hb genes found! Check HB_PATTERN or species. percent.hb will be all 0.")
+    }
+
+    # 额外的 ribosome 和 novelty 指标（可选）
+    RIBO_PATTERN <- "^RPS|^RPL"
+    seurat_obj[["percent.ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = RIBO_PATTERN)
+    ribo_genes_found <- grep(RIBO_PATTERN, rownames(seurat_obj), value = TRUE)
+    message(sprintf("  Ribo genes matched: %d (%s)",
+                    length(ribo_genes_found),
+                    paste(head(ribo_genes_found, 5), collapse = ", ")))
+    seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA) / log10(seurat_obj$nCount_RNA)
+
+    # ---------- 质控前小提琴图 ----------
+    vln_nCount   <- VlnPlot(seurat_obj, features = "nCount_RNA",   pt.size = 0) + ggtitle("nCount_RNA")
+    vln_nFeature <- VlnPlot(seurat_obj, features = "nFeature_RNA", pt.size = 0) + ggtitle("nFeature_RNA")
+    vln_mt       <- VlnPlot(seurat_obj, features = "percent.mt",   pt.size = 0) + ggtitle("percent.mt")
+    vln_hb       <- VlnPlot(seurat_obj, features = "percent.hb",   pt.size = 0) + ggtitle("percent.hb")
+    vln_ribo     <- VlnPlot(seurat_obj, features = "percent.ribo", pt.size = 0) + ggtitle("percent.ribo")
+    vln_novelty  <- VlnPlot(seurat_obj, features = "log10GenesPerUMI", pt.size = 0) + ggtitle("Novelty")
+
+    combined_vln_full <- (vln_nCount | vln_nFeature | vln_ribo) /
+                         (vln_mt | vln_hb | vln_novelty)
+    ggsave(file.path(projectPath, "Output",
+                     paste0(sample, ".QC_6Metrics_BeforeFilter.png")),
+           plot = combined_vln_full, width = 15, height = 10, dpi = 300)
+
+    # ==========================================================  
+    # ★ 先保存原始（未过滤）对象到 seurat_list_raw  
+    # ==========================================================  
+    seurat_list_raw[[sample]] <- seurat_obj 
+
+    # ==========================================================  
+    # 步骤 D：QC 过滤（subset）  
+    # ==========================================================  
+    cells_before <- ncol(seurat_obj)
+
+    seurat_obj_filtered <- subset(seurat_obj,
+                                  subset = nFeature_RNA > MIN_FEATURES &
+                                           nFeature_RNA < MAX_FEATURES &
+                                           nCount_RNA   > MIN_COUNTS &
+                                           percent.mt   < MAX_MT_PERCENT &
+                                           percent.hb   < MAX_HB_PERCENT &
+                                           log10GenesPerUMI > MIN_NOVELTY)
+
+    cells_after <- ncol(seurat_obj_filtered)
+
+    n_low_feature  <- sum(seurat_obj$nFeature_RNA <= MIN_FEATURES)
+    n_high_feature <- sum(seurat_obj$nFeature_RNA >= MAX_FEATURES)
+    n_low_count    <- sum(seurat_obj$nCount_RNA   <= MIN_COUNTS)
+    n_high_mt      <- sum(seurat_obj$percent.mt   >= MAX_MT_PERCENT)
+    n_high_hb      <- sum(seurat_obj$percent.hb   >= MAX_HB_PERCENT)
+    n_low_novelty  <- sum(seurat_obj$log10GenesPerUMI <= MIN_NOVELTY, na.rm = TRUE)
+
+    message(sprintf("  [%s] QC filtering: %d -> %d cells (removed %d total)",  
+                    sample, cells_before, cells_after, cells_before - cells_after))  
+    message(sprintf("    - nFeature < %d:  %d cells", MIN_FEATURES, n_low_feature))  
+    message(sprintf("    - nFeature > %d: %d cells", MAX_FEATURES, n_high_feature))  
+    message(sprintf("    - nCount   < %d:  %d cells", MIN_COUNTS, n_low_count))  
+    message(sprintf("    - %%mt     >= %d%%:  %d cells", MAX_MT_PERCENT, n_high_mt))  
+    message(sprintf("    - %%hb     >= %d%%:   %d cells", MAX_HB_PERCENT, n_high_hb))  
+    message(sprintf("    - novelty  <= %.1f:     %d cells", MIN_NOVELTY, n_low_novelty))
+
+    # 过滤后统计
+    vln_nCount_f   <- VlnPlot(seurat_obj_filtered, features = "nCount_RNA",   pt.size = 0) + ggtitle("nCount_RNA")
+    vln_nFeature_f <- VlnPlot(seurat_obj_filtered, features = "nFeature_RNA", pt.size = 0) + ggtitle("nFeature_RNA")
+    vln_mt_f       <- VlnPlot(seurat_obj_filtered, features = "percent.mt",   pt.size = 0) + ggtitle("percent.mt")
+    vln_hb_f       <- VlnPlot(seurat_obj_filtered, features = "percent.hb",   pt.size = 0) + ggtitle("percent.hb")
+    vln_ribo_f     <- VlnPlot(seurat_obj_filtered, features = "percent.ribo", pt.size = 0) + ggtitle("percent.ribo")
+    vln_novelty_f  <- VlnPlot(seurat_obj_filtered, features = "log10GenesPerUMI", pt.size = 0) + ggtitle("Novelty")
+
+    combined_vln_f <- (vln_nCount_f | vln_nFeature_f | vln_mt_f) / (vln_hb_f | vln_ribo_f | vln_novelty_f)
+    ggsave(file.path(projectPath, "Output",
+                     paste0(sample, ".QC_ViolinPlots_AfterFilter.png")),
+           plot = combined_vln_f, width = 15, height = 10, dpi = 300)
+
+    # 存入过滤后列表
+    seurat_list_filtered[[sample]] <- seurat_obj_filtered
+    sample_ids <- c(sample_ids, sample)
+
+    # 记录 QC 摘要
+    qc_summary[[sample]] <- data.frame(
+      Sample              = sample,
+      Raw_Barcodes        = if (!is.na(get_cellranger_cells(base_path)) && get_cellranger_cells(base_path) > 0) get_cellranger_cells(base_path) else NA,
+      After_EmptyDrops    = n_real_cells,
+      Empty_Rate_Pct      = empty_rate,
+      Ambient_Method      = ifelse(has_raw, "SoupX", "DecontX"),
+      Ambient_Rate_Pct    = round(mean_contamination * 100, 2),
+      Cells_Before_QC     = cells_before,
+      Removed_LowFeature  = n_low_feature,
+      Removed_HighFeature = n_high_feature,
+      Removed_LowCount    = n_low_count,
+      Removed_HighMT      = n_high_mt,
+      Removed_HighHb      = n_high_hb,
+      Cells_After_QC      = cells_after,
+      stringsAsFactors    = FALSE
+    )
+
+  }, error = function(e) {
+    message(paste("Error processing sample:", sample))
+    message(conditionMessage(e))
+  })
+}
+
+# ============================================================
+# 输出 QC 汇总表
+# ============================================================
+# 将 qc_summary 列表转为 DataFrame
+qc_summary_df <- do.call(rbind, qc_summary)
+
+# 为了确保 Raw Cells 列存在且与样本对齐，按样本顺序填充 NA
+if (!"Raw_Barcodes" %in% names(qc_summary_df)) {
+  qc_summary_df$Raw_Barcodes <- NA
+}
+write.csv(qc_summary_df,
+          file.path(projectPath, "Output",
+                    paste0(date_tag, "_QC_Summary_Full.csv")),
+          row.names = FALSE)
+message("\n========== QC Summary ==========")
+print(qc_summary_df)
+
+# ============================================================
+# ★ 动态样本数
+# ============================================================
+n_samples_raw      <- length(seurat_list_raw)
+n_samples_filtered <- length(seurat_list_filtered)
+
+message(sprintf("Samples in raw list: %d", n_samples_raw))
+message(sprintf("Samples in filtered list: %d", n_samples_filtered))
+
+# ============================================================
+# ★ 保存：原始（QC 过滤前）对象列表
+# ============================================================
+save_file_raw <- file.path(projectPath, "Data",
+                           make_filename(n_samples_raw,
+                                         "AfterEmptyDrops_AmbientRNA_BeforeQC",
+                                         prefix = "01a_"))
+save(seurat_list_raw, file = save_file_raw)
+message(sprintf("Saved raw list -> %s", save_file_raw))
+
+# ============================================================
+# ★ 保存：QC 过滤后对象列表
+# ============================================================
+save_file_filtered <- file.path(projectPath, "Data",
+                                make_filename(n_samples_filtered,
+                                              "AfterEmptyDrops_AmbientRNA_AfterQC",
+                                              prefix = "01b_"))
+save(seurat_list_filtered, file = save_file_filtered)
+message(sprintf("Saved filtered list -> %s", save_file_filtered))
+
+
+# ============================================================
+# 2. DoubletFinder 双细胞检测
+# ============================================================
+
+# 如果需要从中间恢复：
+# load('/path/to/your/02_2021216_4Samples_AfterQC_AfterDF.Rdata')
+
+# 确保 seurat_list 已经在全局环境中，且来自上一步 QC 过滤后的结果
+# 此处假设 seurat_list 已经是 seurat_list_filtered 的集合
+seurat_list <- seurat_list_filtered
+
+umap_pdf <- file.path(projectPath, "Output",
+                      paste0(date_tag, "_All_DoubletFinder_UMAP.pdf"))
+pdf(umap_pdf, width = 10, height = 8)
+
+doublet_summary <- list()
+
+for (i in seq_along(seurat_list)) {
+  obj_name    <- names(seurat_list)[i]
+  current_obj <- seurat_list[[obj_name]]
   
-  message(sprintf("Processing %d/%d: %s", i, length(seurat_list), obj_name))  
+  message(sprintf("\nDoubletFinder %d/%d: %s (%d cells)",
+                  i, length(seurat_list), obj_name, ncol(current_obj)))
   
-  # 基础预处理  
-# 基础预处理（到PCA阶段）
-  current_obj <- current_obj %>%  
-    NormalizeData() %>%  
-    FindVariableFeatures() %>%  
-    ScaleData() %>%  
-    RunPCA(verbose = FALSE)
+  # ---------- 基础预处理 ----------
+  current_obj <- current_obj %>%
+    NormalizeData(verbose = FALSE) %>%
+    FindVariableFeatures(verbose = FALSE) %>%
+    ScaleData(verbose = FALSE) %>%
+    RunPCA(verbose = FALSE, seed.use = 42) %>%
+    RunUMAP(dims = PC_DIMS, verbose = FALSE, seed.use = 42)
   
-  # 自动参数优化
-  sweep.res <- paramSweep(current_obj, PCs = 1:10, sct = FALSE)
+  # ---------- DoubletFinder 参数优化 ----------
+  sweep.res   <- paramSweep(current_obj, PCs = PC_DIMS, sct = FALSE)
   sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
-  bcmvn <- find.pK(sweep.stats)
+  bcmvn       <- find.pK(sweep.stats)
   
-  ############## 返回 NULL，意味着它无法确定这个最佳点。 下面画图手动确定拐点
-  # 绘制 BCmetric 与 pK 的关系图
-  p0 = ggplot(bcmvn, aes(x = pK, y = BCmetric, group = 1)) +
+  # BCmetric vs pK 图
+  p_bcmetric <- ggplot(bcmvn, aes(x = pK, y = BCmetric, group = 1)) +
     geom_point() +
     geom_line() +
     theme_classic() +
-    labs(x = "pK Value", y = "BCmetric", title = "BCmetric vs. pK")
-  ggsave(file.path(projectPath, "Output",paste0(obj_name,"_All_doubletFinderPlots.pdf")), plot = p0, width = 12, height = 12, dpi = 300)
-
-  # 展示了 BCmetric（Y轴）随着 pK 值（X轴）变化的趋势。
-  # BCmetric 可以理解为模型区分单细胞和双细胞的“信心分数”或“区分度”，
-  # 我们的目标就是找到让这个分数最高的 pK 值
-   
-  # 选择最佳pK值
+    labs(x = "pK Value", y = "BCmetric",
+         title = paste0(obj_name, ": BCmetric vs. pK"))
+  ggsave(file.path(projectPath, "Output", paste0(obj_name, "_BCmetric_vs_pK.png")),
+         plot = p_bcmetric, width = 8, height = 6, dpi = 300)
   
+  # 选择最佳 pK 值
   pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  message(sprintf("  Best pK = %s", pK))
   
-  #pK <- 0.25
-  # 计算预期双细胞数量（按细胞数的2.5%估算，可根据实验调整）
-  nExp_poi <- round(0.025 * ncol(current_obj)) 
+  # 动态估算预期双细胞数（10x 经验值）
+  nCells              <- ncol(current_obj)
+  doublet_rate_expected <- nCells * 0.8 / 1000 / 100
+  nExp_poi            <- max(round(doublet_rate_expected * nCells), 1)
+  message(sprintf("  Expected doublets (suggested): %d (rate ~%.2f%%)",
+                  nExp_poi, doublet_rate_expected * 100))
   
-  # 运行DoubletFinder
+  # ---------- 运行 DoubletFinder ----------
   current_obj <- doubletFinder(
-    current_obj, 
-    PCs = 1:10, 
-    pN = 0.25, 
-    pK = pK, 
-    nExp = nExp_poi, 
-    #reuse.pANN = FALSE, 
-    sct = FALSE
+    current_obj,
+    PCs  = PC_DIMS,
+    pN   = 0.25,
+    pK   = pK,
+    nExp = nExp_poi,
+    sct  = FALSE
   )
   
-  # 提取双细胞分类结果
+  # 提取分类结果
   df.class <- paste("DF.classifications_0.25", pK, nExp_poi, sep = "_")
   current_obj$Doublet_Classification <- current_obj@meta.data[[df.class]]
   
-  # 添加双胞率计算和标注  
-  doublet_count <- sum(current_obj$Doublet_Classification == "Doublet")  
-  total_cells <- ncol(current_obj)  
-  doublet_rate <- round(doublet_count / total_cells * 100, 2)  
-  # 生成带统计信息的绘图  
-  doublet_plot <- DimPlot(current_obj,   
-                         group.by = "Doublet_Classification",  
-                         reduction = "pca",  
-                         cols = c("gray90", "red")) +  # 设置颜色  
-    labs(title = paste0(obj_name, " Doublet Detection")) +  
-    annotate("text",  
-             x = Inf, y = Inf,  # 右上角定位  
-             label = paste0("Doublet Rate: ", doublet_rate, "%\n",  
-                          "Predicted: ", nExp_poi, " (", doublet_count, " found)"),  
-             hjust = 1.1, vjust = 1.1,  # 微调位置  
-             size = 5,  
-             color = "darkred",  
-             fontface = "bold") +  
-    theme(  
-      plot.title = element_text(size=14, face="bold"),  
-      legend.position = c(0.8, 0.2)  # 调整图例位置  
-    )  
+  # 统计
+  doublet_count <- sum(current_obj$Doublet_Classification == "Doublet")
+  total_cells   <- ncol(current_obj)
+  doublet_rate  <- round(doublet_count / total_cells * 100, 2)
+  
+  # ---------- 可视化 ----------
+  doublet_plot <- DimPlot(current_obj,
+                          group.by  = "Doublet_Classification",
+                          reduction = "umap",
+                          cols = c("Doublet" = "red", "Singlet" = "gray90")) +
+    labs(title = paste0(obj_name, " Doublet Detection")) +
+    annotate("text",
+             x = Inf, y = Inf,
+             label = paste0("Doublet Count: ", doublet_count, "  (", doublet_rate, "%)"),
+             hjust = 1.1, vjust = 1.1,
+             size = 4, color = "darkred", fontface = "bold") +
+    theme(plot.title = element_text(size = 14, face = "bold"),
+          legend.position = "right")
   print(doublet_plot)
-  # 过滤双细胞
+  
+  ggsave(file.path(projectPath, "Output", "DoubletFinder",
+                   paste0(obj_name, "_DoubletFinder_UMAP.png")),
+         plot = doublet_plot, width = 10, height = 8, dpi = 300)
+  
+  # ---------- 过滤双细胞 ----------
   singlet_cells <- colnames(current_obj)[current_obj$Doublet_Classification == "Singlet"]
   current_obj <- subset(current_obj, cells = singlet_cells) %>%
-    NormalizeData() %>%
-    FindVariableFeatures() %>%
-    ScaleData() %>%
-    RunPCA(verbose = FALSE)  
+    NormalizeData(verbose = FALSE) %>%
+    FindVariableFeatures(verbose = FALSE) %>%
+    ScaleData(verbose = FALSE) %>%
+    RunPCA(verbose = FALSE, seed.use = 42)
   
-  seurat_list[[obj_name]] <- current_obj  
-}
-save(seurat_list,   
-    file = file.path(projectPath, "Data", "02_2021216_4Samples_ObjectOriginal_AfterDF.Rdata"))  
+  message(sprintf("  [%s] After DoubletFinder: %d -> %d cells",
+                  obj_name, total_cells, ncol(current_obj)))
   
-
-#unintegrated <- merge(seurat_list[[1]], seurat_list[2:4]) 
-
-unintegrated <- merge(seurat_list[[1]], 
-                      y = list(seurat_list[[2]], seurat_list[[4]]))
-unintegrated <- NormalizeData(unintegrated)
-unintegrated <- FindVariableFeatures(unintegrated)
-unintegrated <- ScaleData(unintegrated)
-unintegrated <- RunPCA(unintegrated)
-unintegrated <- FindNeighbors(unintegrated, dims = 1:30)
-unintegrated <- RunUMAP(unintegrated, dims = 1:30,reduction.name = "unintegrated")
-
-save(unintegrated,file = file.path(projectPath, "Data", "03_2021216_3Samples_ObjectOriginal_AfterDF_MergedObj.Rdata"))
-
-
-
-#########################################################################
-############## ------------------------ 在R里面可以实现的整合方法
-integration_info <- list(  
-  list(reduction = "integrated.cca", cluster.name = "cca_clusters",method.use ='CCAIntegration',umap.reduction = 'umap.cca'),  
-  list(reduction = "integrated.rpca", cluster.name = "rpca_clusters",method.use ='RPCAIntegration',umap.reduction = 'umap.rpca'),  
-  list(reduction = "harmony", cluster.name = "harmony_clusters",method.use ='HarmonyIntegration',umap.reduction = 'umap.harmony'),  
-  list(reduction = "integrated.jointPCA", cluster.name = "jointPCA_clusters",method.use = 'JointPCAIntegration',umap.reduction = 'umap.jointPCA'),
-  list(reduction = "fastMNN", cluster.name = "fastMNN_clusters",method.use ='FastMNNIntegration',umap.reduction = 'umap.fastMNN'),  
-  list(reduction = "integrated.scvi", cluster.name = "scVI_clusters",method.use = 'scVIIntegration')    
-)
-
-obj=unintegrated
-#objIntegrated_List = list() 
-
-i=5
-red.use <- integration_info[[i]]$reduction  
-clst.name <- integration_info[[i]]$cluster.name  
-method.use <- integration_info[[i]]$method.use
-umap.reduction <- integration_info[[i]]$umap.reduction
-
-objIntegrated<- IntegrateLayers(
-		object = obj,   
-		method = method.use,  
-		orig.reduction = "pca",       # 原始降维的名称  
-		new.reduction = red.use,  
-		verbose = FALSE  
-    )
-# re-join layers after integration
-objIntegrated[["RNA"]] <- JoinLayers(objIntegrated[["RNA"]])
-
-objIntegrated <- FindNeighbors(objIntegrated, reduction = red.use, dims = 1:30)
-objIntegrated <- RunUMAP(objIntegrated, dims = 1:30, reduction = red.use,reduction.name = umap.reduction)
-
-resolutions <- c(0.025, 0.03,0.04,0.05, 0.1, 0.15, 0.2, 0.25)  
-for (j in seq_along(resolutions)) {
-  res <- resolutions[j]  
-  objIntegrated <- FindClusters(objIntegrated, resolution = 0.04,algorithm = 1)
-}
+  seurat_list[[obj_name]] <- current_obj
   
-clustree_plot <- clustree(objIntegrated, prefix = "RNA_snn_res.") +  
-   ggtitle(paste0(obj_name, " Clustering Tree")) +  
-   theme(plot.title = element_text(size = 14, face = "bold"))  
-print(clustree_plot) 
-ggsave(file.path(projectPath, "Output","2021216_3Samples_clustreePlot.pdf"), plot = clustree_plot, width = 12, height = 12, dpi = 300)
- 
-  
-
-
-pdf(file.path(projectPath, "Output","2021216_3Samples_DimPlot.pdf"))
-Idents(objIntegrated) = objIntegrated$RNA_snn_res.0.1
-umap_plot <- DimPlot(  
-    objIntegrated,  
-    reduction = umap.reduction ,  
-    label = TRUE  
-  ) +  
-    ggtitle(paste0(obj_name, " (Final resolution = ", '0.1', ")"))  
-print(umap_plot)  					   
-
-CellDimPlot(
-  srt = objIntegrated,
-  group.by = c("orig.ident", "RNA_snn_res.0.1"),
-  reduction = umap.reduction ,
-  #theme_use = "theme_blank"
-)
-
-CellDimPlot(
-  srt = unintegrated,
-  group.by = c("orig.ident"),
-  reduction = 'unintegrated',
-  #theme_use = "theme_blank"
-)
-dev.off()
-
-objIntegrated$cell_type = objIntegrated$RNA_snn_res.0.1
-
-#### 注释
-library(celldex)
-library(SingleR)
-library(BiocParallel)
-library(ggplot2)
-
-library(DeepCellSeek)
-library(Seurat)
-markers_df <- FindAllMarkers(object = objIntegrated)
-Sys.setenv(USE_DEEPCELLSEEK_API = "TRUE")
-
-annotations <- deepcellseek_celltype(
-  input = markers_df,
-  tissuename = "Brain",  # Providing tissue context is important
-  species = "Mouse",
-  model = "gpt-5"  # Choose any supported model
-)
-objIntegrated@meta.data$LLM_Annotation <- as.factor(annotations[as.character(Idents(objIntegrated))])
-DimPlot(objIntegrated, group.by = "LLM_Annotation", label = TRUE, repel = TRUE)
-
-
-
-  
-pdf(file.path(projectPath, "Output","2021216_3Samples_MarkerGenens.HeatmapPlot.pdf"),height=12) 
-objIntegrated.markers<-FindAllMarkers(objIntegrated,only.pos=TRUE,min.pct=0.25)
-#top10<-objIntegrated.markers%>%group_by(cluster)%>%top_n(n=10,wt=avg_log2FC)
-
-objIntegrated.markers %>%
-    group_by(cluster) %>%
-    dplyr::filter(avg_log2FC > 1) %>%
-    slice_head(n = 10) %>%
-    ungroup() -> top10 
-set.seed(123) # 设置随机种子
-objIntegrated_sampled <- subset(objIntegrated, downsample = 2000)
-
-DoHeatmap(objIntegrated_sampled, features = top10$gene) + NoLegend()
-dev.off()
-
-
-
-# 根据 Marker 基因创建细胞类型注释
-Idents(objIntegrated) = objIntegrated$RNA_snn_res.0.1
-
-# 定义更新后的 Marker 列表
-all_markers <- list(
-  # 星形胶质细胞
-  Astrocyte = unique(c("Aqp4", "Gja1", "Atp1b2", "Aldoc", "Clu", "Slc1a3", "Mt3", 
-                       "Gfap", "S100b", "Slc1a2", "Aldh1l1", "Fabp7", "Glul", "Sox9", "Cd44", "Sparcl1")),
-  # 少突胶质细胞
-  Oligodendrocytes = unique(c("Mbp", "Plp1", "Mog", "Cldn11", "Mobp", 
-                              "Cnp", "Mag", "Rtn4", "Slc44a1", "Opalin", "Qk", "Tf")), 
-  # 少突前体细胞
-  OPC = unique(c("Pdgfra", "Cspg4", "Olig2", "Sox10")), 
-  # 小胶质细胞
-  Microglia = unique(c("C1qb", "Ctss", "Tyrobp", "Hexb", "Fcer1g", "Cx3cr1", 
-                       "Aif1", "P2ry12", "Tmem119", "Csf1r", "C3", "Itgam", "Trem2", 
-                       "Ly86", "Cd68", "Cd14", "Spi1")),
-  # 兴奋性神经元
-  Excitatory_Neuron = unique(c("Slc17a7", "Slc17a6", "Neurod2", "Tbr1", "Gria1", 
-                               "Syt1", "Snap25", "Rbfox3", "Neurod6", "Map2", "Tubb3", 
-                               "Grin1", "Camk2a", "Syn1", "Elavl4")),
-  # 抑制性神经元（包括 GABA能神经元）
-  Inhibitory_Neuron = unique(c("Gad1", "Gad2", "Lhx6", "Nkx2-1", "Npy", "NPY51", "NR2F2")),
-  # 神经元前体细胞
-  Neuronal_Progenitors = unique(c("Ascl1", "Dcx", "Sox11", "Neurod1", "Prox1", 
-                                  "Pax6", "Hes5", "Vim", "Eomes", "Emx2", "Nes")),  
-  # 红细胞
-  Erythrocyte = unique(c("Hbb-bt", "Hbb-bs", "Hba-a1", "Hba-a2")),
-  # 神经干细胞/增殖细胞
-  NSC_Proliferating = unique(c("Mki67", "Top2a", "Pclaf", "Rrm2"))
-)
-
-# 打印调整后的 Marker 列表，确保没有重复基因
-all_markers
-p_dot <- DotPlot(objIntegrated, 
-                 features = all_markers,
-                 group.by = "RNA_snn_res.0.1",  # 或用 "cell_type" 如果已添加注释
-                 cols = c("lightgrey", "red"),
-                 dot.scale = 6) +
-  RotatedAxis() +
-  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1),
-        axis.text.y = element_text(size = 9),
-        legend.position = "right") +
-  ggtitle("Cell Type Markers by Cluster")
-pdf(file.path(projectPath, "Output","2021216_3Samples_MarkerGenens.DotPlot.pdf"),height=4,width=25) 
-print(p_dot)
-dev.off()
-
-
-
-table(Idents(objIntegrated))
-Idents(objIntegrated) = 'RNA_snn_res.0.1'
-cluster_annotation <- c(
-  "0" = "C0 unknown",
-  "1" = "NSC_Proliferating",     #*
-  "2" = "Astrocyte",             #*
-  "3" = "Excitatory_Neuron",     #*
-  "4" = "Oligodendrocytes",      #* 
-  "5" = "Astrocyte",             #*
-  "6" = "Microglia",             #*
-  "7" = "C7 unknown",
-  "8" = "Erythrocyte",           #*
-  "9" = "Astrocyte",             #*
-  "10" = "Unknown"               #*
-)
-# 添加到 Seurat 对象
-objIntegrated =  RenameIdents(objIntegrated, cluster_annotation)
-objIntegrated[['cell_type']] <-Idents(objIntegrated)
-
-# 可视化
-p1 <- DimPlot(objIntegrated, 
-              group.by = "cell_type", 
-              reduction = "umap.fastMNN",
-              label = TRUE,
-              repel = TRUE,
-              label.size = 4) +
-  ggtitle("Cell Type Annotation") +
-  theme(legend.position = "right")
-pdf(file.path(projectPath, "Output","2021216_3Samples_MarkerGenens.Umap.pdf")) 
-print(p1)
-#用阈值/打分把 astrocyte 先标出来    
-astro_markers <- c("Aqp4", "Gja1", "Atp1b2", "Aldoc", "Clu", "Slc1a3", "Mt3", 
-                       "Gfap", "S100b", "Slc1a2", "Aldh1l1", "Fabp7", "Glul", "Sox9", "Cd44", "Sparcl1")
-objIntegrated <- AddModuleScore(objIntegrated, features = list(astro_markers), name = "AstroScore")
-VlnPlot(objIntegrated, features = "AstroScore1", group.by = "RNA_snn_res.0.1")
-FeaturePlot(objIntegrated, reduction="umap.fastMNN", features="AstroScore1")
-	
-############
-#在 UMAP 上确认星形 marker 是否集中成簇
-FeaturePlot(
-  objIntegrated,
-  reduction = "umap.fastMNN",
-  features = astro_markers,
-  ncol = 4
-) 
-dev.off()     
-
-
-save(objIntegrated,file = file.path(projectPath, "Data",   
-       paste0("04_2021216_3Samples_ObjectOriginal_AfterDF_integratedObjDetails_",method.use,"_Annotationed.Rdata")))
-  
-objIntegrated
-
-####################
-# 加载所需的库
-library(Seurat)
-
-# 假设 objIntegrated 是您的 Seurat 对象
-# 1. 提取 Astrocyte subset
-objSubset <- subset(objIntegrated, idents = "Astrocyte")
-objSubset <- NormalizeData(objSubset)
-objSubset <- FindVariableFeatures(objSubset)
-objSubset <- ScaleData(objSubset)
-objSubset <- RunPCA(objSubset)
-objSubset <- FindNeighbors(objSubset, dims = 1:10)
-
-objSubset <- FindClusters(objSubset, resolution = 0.05)
-objSubset <- RunUMAP(objSubset, dims = 1:10)
-DimPlot(objSubset, reduction = "umap", label = TRUE)
-
-
-astrocyte_subtypes <- list(
-  # 胶质纤维形成星形胶质细胞（GFAP+ Astrocytes）
-  GFAP_Astro = unique(c("S100b", "Aqp4")),
-  # 层状星形胶质细胞
-  Laminar_Astro = unique(c("Gs", "Slc1a3")),
-  # 少突胶质细胞样星形胶质细胞（OPC-like Astrocytes）
-  OPC_like_Astro = unique(c("Pdgfra", "Olig2", "Sox10")),
-  # 新生星形胶质细胞（Neonatal Astrocytes）
-  Neonatal_Astro= unique(c("Gfp", "Nes")),
-  # 反应性星形胶质细胞
-  Reactive_Astro = unique(c("Gfap",  "Il6")),
-  # 足突星形胶质细胞
-  Perivascular_Astro = unique(c("Connexin43", "Gja1"))
-)
-# 打印 astrocyte_subtypes 列表
-
-p_dot <- DotPlot(objSubset, 
-                 features = astrocyte_subtypes,
-                 group.by = "RNA_snn_res.0.05",  # 或用 "cell_type" 如果已添加注释
-                 cols = c("lightgrey", "red"),
-                 dot.scale = 6) +
-  RotatedAxis() +
-  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1),
-        axis.text.y = element_text(size = 9),
-        legend.position = "right") +
-  ggtitle("Cell Type Markers of Astrocyte")
-    
-  
-cluster_annotation <- c(
-  "0" = "C0 unknown",
-  "1" = "OPC_like_Astro",     #*
-  "2" = "Astrocyte",             #*
-  "3" = "Reactive_Astro",     #*
-
-objSubset.markers<-FindAllMarkers(objSubset,only.pos=TRUE,min.pct=0.25)
-#top10<-objIntegrated.markers%>%group_by(cluster)%>%top_n(n=10,wt=avg_log2FC)
-write.csv(objSubset.markers,file.path(projectPath, "Data",   
-      "2021218_3Samples_subObjectAstrocyte_ReClassed_FindAllMarkers.csv"),quote=F)
-objSubset.markers %>%
-    group_by(cluster) %>%
-    dplyr::filter(avg_log2FC > 1) %>%
-    slice_head(n = 30) %>%
-    ungroup() -> top10 
-
-
-DoHeatmap(objSubset, features = top10$gene) + NoLegend()
-
-
-save(objSubset,file = file.path(projectPath, "Data",   
-       "04_2021216_3Samples_subObjectAstrocyte_ReClassed_objSubset.Rdata"))
-  
-
-
-
-
-
-
-
-
-
-
-ref <- celldex::MouseRNAseqData()
-
-objIntegrated
-objIntegrated@meta.data$seurat_clusters = objIntegrated$RNA_snn_res.0.05
-query_data <- GetAssayData(objIntegrated, 
-                           layer = "data", # 使用 log-normalized counts
-                           assay = "RNA") # 确保使用原始 'RNA' Assay
-						   
-						 
-clusters <- objIntegrated@meta.data$seurat_clusters 
-pred_results <- SingleR(sc_data = query_data,
-                        ref_data = ref,
-                        #labels = ref$label.main, # 使用主要标签进行粗略注释
-                        clusters = clusters
-                      ) 				  				  
-objIntegrated$SingleR_label <- pred_results$labels[match(objIntegrated@meta.data$seurat_clusters, rownames(pred_results))]
-
-print(table(objIntegrated$SingleR_label))
-
-
-avg <- AverageExpression(objIntegrated, assays = "RNA", slot = "data",
-                         group.by = "seurat_clusters", verbose = FALSE)$RNA
-pred <- SingleR(sc_data = avg,
-                        ref_data = ref_data,
-                        labels = ref_data$label.main, # 使用主要标签进行粗略注释
-                      ) 
-cluster_ids <- as.character(objIntegrated$seurat_clusters)
-objIntegrated$SingleR_label <- pred$labels[match(cluster_ids, colnames(avg))]
-
-table(objIntegrated$SingleR_label)
-
-
-  
-  # -------------------- 1. 预设参数与对象 --------------------  
-  # 尝试不同的resolution值  
-  resolutions <- c(0.025, 0.05, 0.1, 0.15, 0.2, 0.25)  
-  metrics_df <- data.frame(  
-    resolution = resolutions,  
-    modularity = numeric(length(resolutions)),  
-    silhouette = numeric(length(resolutions)),  
-    n_clusters = integer(length(resolutions))  
-  )
-  
-  # -------------------- 2. 构建SNN图 --------------------  
-  # 构建共享最近邻图（复用后续计算）  
-  current_obj <- FindNeighbors(
-    current_obj, 
-	features = VariableFeatures(current_obj),  
-    k.param = 20,  # 根据数据量调整（建议范围15-50）  
-    prune.SNN = 1/15,  # 保持相同剪枝参数  
-	dims = 1:10,
-  #  graph.name = "snn_graph"  # 指定SNN图名称  
-   )  
-  snn_graph <- current_obj@graphs$snn_graph  # 假设使用默认图名称
-
-  # -------------------- 3. 循环评估不同的resolution --------------------   
-  # 循环计算不同 resolution 的聚类和指标  
-  for (j in seq_along(resolutions)) {  
-    # 3.1 获取当前聚类标签  
-    current_obj <- FindClusters(  
-      current_obj,   
-      resolution = res,
-      algorithm = 1	  
-    )   
-    # 3.2 从meta.data中获取聚类标签
-    cluster_col <- paste0("RNA_snn_res.", res)
-    clusters <- current_obj[[cluster_col, drop = TRUE]]
-	
-  # 1. 设置需要测试的一系列分辨率  
-    resolutions <- c(0.025, 0.05, 0.1, 0.15, 0.2, 0.25)  
-
-  # 2. 先基于 Seurat 对象构建 SNN 图（供后续循环复用）  
-    current_obj <- FindNeighbors(  
-      current_obj,  
-      features = VariableFeatures(current_obj),  
-      dims = 1:10,  
-      k.param = 20,       # 根据数据量大小微调  
-      prune.SNN = 1/15,   # 与需求保持一致  
-   # graph.name = "snn_graph"  # 如需要自定义图名称，可打开此行  
-    )  
-
-    # 3. 初始化一个 data.frame 用于记录各分辨率的指标  
-    metrics_df <- data.frame(  
-      resolution = resolutions,  
-      modularity = numeric(length(resolutions)),  
-      silhouette = numeric(length(resolutions)),  
-      n_clusters = integer(length(resolutions))  
-    )  
-
-    # 4. 循环评估不同 resolution  
-    for (ii in seq_along(resolutions)) {  
-      res <- resolutions[ii]  
-  
-      # 4.1 运行 FindClusters  
-      # 如果上面 graph.name 指定为 "snn_graph" 记得在这里也指定  
-      current_obj <- FindClusters(  
-        current_obj,  
-        resolution = res,  
-        algorithm = 1  # Louvain，若想尝试 Leiden 可改为 4  
-        # graph.name = "snn_graph"  
-      )  
-  
-      # 4.2 从 meta.data 中获取该分辨率的聚类标签列  
-      cluster_col <- paste0("RNA_snn_res.", res)  # 如果实际上是 snn_graph_res.[res]，请改这里  
-      clusters <- current_obj[[cluster_col, drop = TRUE]]
-  
-      # 4.3 计算模块度 Modularity（基于 igraph）  
-      #     先获取 SNN 图（默认名称可能是 'RNA_snn'，若自定义则改为 'snn_graph'）  
-      snn_graph <- current_obj@graphs$RNA_snn  
-      # 转成 igraph 对象  
-      library(igraph)  
-      ig <- graph_from_adjacency_matrix(  
-        snn_graph,  
-        mode = "undirected",  
-        weighted = TRUE
-      ) 
-      metrics_df$modularity[ii] <- modularity(ig, membership = clusters)  
-
-      # 4.4 计算轮廓系数 Silhouette（在 PCA 空间）  
-      #     抽样部分细胞加快计算  
-      library(cluster)  
-      set.seed(42)  
-      sampled_cells <- sample(colnames(current_obj), size = min(1000, ncol(current_obj)))  
-      pca_mat <- Embeddings(current_obj, reduction = "pca")[sampled_cells, 1:30]  
-      sil_result <- cluster::silhouette(as.numeric(clusters[sampled_cells]), dist(pca_mat))  
-      metrics_df$silhouette[ii] <- mean(sil_result[, "sil_width"])  
-  
-      # 4.5 记录聚类数  
-      metrics_df$n_clusters[ii] <- length(unique(clusters))  
-    }  
-  # 在循环中添加 clustree 图  
-  clustree_plot <- clustree(current_obj, prefix = "RNA_snn_res.") +  
-    ggtitle(paste0(obj_name, " Clustering Tree")) +  
-    theme(plot.title = element_text(size = 14, face = "bold"))  
-  print(clustree_plot)
-
-  # 5. 根据评估指标选最优分辨率  
-  #   这里以模块度和轮廓系数的平均排名为例，也可自定义更复杂的方法  
-  metrics_df <- metrics_df %>%  
-    mutate(  
-      # 标准化分数  
-      scaled_mod = scale(modularity),  
-      scaled_sil = scale(silhouette),  
-      # 简单加权综合分数（可根据需要微调权重）  
-      combined_score = 0.5 * scaled_mod + 0.5 * scaled_sil  
-    )  
-
-  # 6. 找到 combined_score 最高的分辨率  
-  best_res_row <- metrics_df[which.max(metrics_df$combined_score), ]  
-  best_resolution <- best_res_row$resolution  
-  cat("最佳分辨率为:", best_resolution, "\n")  
-  print(best_res_row)
-
-  # -------------------- 6. 应用最优resolution聚类并可视化 --------------------  
-  current_obj <- FindClusters(current_obj, resolution = best_resolution, algorithm = 1)
-  current_obj <- RunUMAP(current_obj, dims = 1:10, verbose = FALSE)
-  umap_plot <- DimPlot(  
-    current_obj,  
-    reduction = "umap",  
-    label = TRUE  
-  ) +  
-    ggtitle(paste0(obj_name, " (Final resolution = ", best_resolution, ")"))  
-  print(umap_plot)  
-
-  # -------------------- 7. 找到Marker基因，存储结果 --------------------  
-  cluster_markers <- FindAllMarkers(  
-    current_obj,  
-    only.pos = TRUE,  
-    min.pct = 0.25,  
-    logfc.threshold = 0.25  
-  )  
-
-  # 在结果中记录双细胞信息
-  marker_list[[obj_name]] <- list(
-    markers = cluster_markers,
-    final_resolution  = best_resolution,
-    doublet_info = list(
-      pK = pK,
-      nExp_poi = nExp_poi,
-      removed_doublets = nExp_poi,
-      remaining_cells = ncol(current_obj)
-	  ) 
-	)
-  # 更新对象  
-  seurat_list[[obj_name]] <- current_obj  
-  
-  # 保存当前进度  
-  save(current_obj,  
-       file = file.path(projectPath, "Data",   
-                       paste0("20250220_45Samples_CanPBMC_Object_", i, ".Rdata")))  
-  } 
-}  
-dev.off()
-
- 
-# 保存最终结果  
-save(seurat_list, marker_list,  
-     file = file.path(projectPath, "Data", "20250227_45Samples_CanPBMC_Object.Rdata"))  
-
-# 创建结果总结报告  
-summary_file <- file.path(projectPath, "Output", "clustering_summary.txt")  
-sink(summary_file)  
-cat("Clustering Analysis Summary\n")  
-cat("=========================\n\n")  
-for(obj_name in names(seurat_list)) {  
-  cat(sprintf("\nSample: %s\n", obj_name)) 
-  # 添加双细胞信息
-  di <- marker_list[[obj_name]]$doublet_info
-  cat(sprintf("Doublet removal:\n"))
-  cat(sprintf("  - pK value: %.3f\n", di$pK))
-  cat(sprintf("  - Predicted doublets: %d\n", di$nExp_poi))
-  cat(sprintf("  - Remaining cells: %d\n", di$remaining_cells))
-  cat(sprintf("  - Doublet removal rate: %.1f%%\n", 
-              100*di$nExp_poi/(di$nExp_poi + di$remaining_cells)))
-			  
-  cat(sprintf("Optimal resolution: %.3f\n", marker_list[[obj_name]]$optimal_resolution))  
-  cat(sprintf("Number of clusters: %d\n",   
-              length(unique(Idents(seurat_list[[obj_name]])))))  
-  cat("Top markers per cluster:\n")  
-  top_markers <- marker_list[[obj_name]]$markers %>%  
-    group_by(cluster) %>%  
-    top_n(5, avg_log2FC)  
-  print(top_markers)  
-  cat("\n-------------------\n")  
-}  
-sink()
-
-
-load(file.path(projectPath, "Data", "20250227_45Samples_CanPBMC_Object.Rdata"))
-seurat_list
-marker_list
-markers = marker_list
-i=44
-names(seurat_list[i]) 
-seurat_list[[i]]$seurat_clusters <- seurat_list[[i]]$RNA_snn_res.0.15
-save(seurat_list,marker_list
-     file = file.path(projectPath, "Data", "20250303_45Samples_CanPBMC_ObjectList.Rdata"))  
-
-A6: 0.15;
-C7: 0.15;
-D6: 0.1;
-K7: 0.15;
-M7: 0.15;
-F6: 0.15;
-G6: 0.15;
-H6: 0.25;
-H9: 0.15;
-I9: 0.1;
-J6: 0.2;
-J9: 0.2;
-K9: 0.1;
-M6: 0.2;
-E9: 0.2;
-M9: 0.1;
-D6−2: 0.15
-
-name = 'D6-2'
-marker_list[[name]]['final_resolution'] = 0.15
-
-load(file.path(projectPath, "Data", "20250303_45Samples_CanPBMC_ObjectList.Rdata"))
-umap_pdf <- file.path(projectPath, "Output", "All_clusterTreeUMAP_Plots.pdf")  
-pdf(umap_pdf, width = 10, height = 8) 
-for(n in (1:length(seurat_list))) {
-  name = names(seurat_list[n])
-  current_obj = seurat_list[[name]]
-  clustree_plot <- clustree(current_obj, prefix = "RNA_snn_res.") +  
-    ggtitle(paste0(name, " Clustering Tree")) +  
-    theme(plot.title = element_text(size = 14, face = "bold"))  
-  print(clustree_plot)
-  best_resolution = marker_list[[name]]['final_resolution']
-  umap_plot <- DimPlot(  
-    current_obj,  
-    reduction = "umap",  
-    label = TRUE  
-  ) +  
-    ggtitle(paste0(name, " (Final resolution = ", best_resolution, ")"))  
-  print(umap_plot)  
-}
-dev.off()
-
-######################
-######-----Azimuth注释
-load(file.path(projectPath, "Data", "20250303_45Samples_CanPBMC_ObjectList.Rdata"))
-library(Seurat)       # >=4.3
-library(SeuratDisk)   # 用于加载 .h5seurat 参考文件
-library(Azimuth)      # GetAzimuthReference() (若 Seurat <4.3 则不需单独安装)
-library(SeuratData)
-library(SeuratWrappers)
-library(ggplot2)
-library(patchwork)
-#ref_file <- "/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/Data/pbmc3k_Azimuth/AzimuthReference_HumanPBMC.Rds"
-#reference <- readRDS(ref_file)   # 加载为 Seurat 对象
-seurat_listAzi = list()
-for(obj_name in names(seurat_list)) {  
-  obj = seurat_list[[obj_name]]
-  scRNA1Azi <- RunAzimuth(obj, reference = "pbmcref")
-  seurat_listAzi[[obj_name]] = scRNA1Azi
-}  
-save(seurat_listAzi,
-     file = file.path(projectPath, "Data", "20250303_45Samples_CanPBMC_ObjectList_Azimuth.Rdata"))  
-
-load(file = file.path(projectPath, "Data", "20250303_45Samples_CanPBMC_ObjectList_Azimuth.Rdata"))
-#################################################################
-######-------- 去死样本单独分析
-target_samples <- c(
-  "C6-1", "C6", "C6-2",
-  "D6-1", "D6", "D6-2",
-  "H9-1", "H9", "H9-2",
-  'B9,C9,D9',   #去死细胞
-  'F9','G9','I9'
-)
-## ------------------------------------------------------------------
-## 2. 在 seurat_listAzi 中筛选
-## ------------------------------------------------------------------
-available <- intersect(target_samples, names(seurat_listAzi))
-missing   <- setdiff(target_samples,  names(seurat_listAzi))
-
-# 提取并按 target_samples 的顺序排序
-seurat_sub <- seurat_listAzi[match(available, names(seurat_listAzi))]
-integration_info <- list(  
-  #list(reduction = "integrated.cca", cluster.name = "cca_clusters",method.use ='CCAIntegration',umap.reduction = 'umap.cca'),  
-  #list(reduction = "integrated.rpca", cluster.name = "rpca_clusters",method.use ='RPCAIntegration',umap.reduction = 'umap.rpca'),  
-  #list(reduction = "harmony", cluster.name = "harmony_clusters",method.use ='HarmonyIntegration',umap.reduction = 'umap.harmony'),  
-  list(reduction = "fastMNN", cluster.name = "fastMNN_clusters",method.use ='FastMNNIntegration',umap.reduction = 'umap.fastMNN')  
-  #list(reduction = "integrated.jointPCA", cluster.name = "jointPCA_clusters",method.use = 'JointPCAIntegration',umap.reduction = 'umap.jointPCA')
-  #list(reduction = "integrated.scvi", cluster.name = "scVI_clusters",method.use = 'scVIIntegration')    
-)
-seurat_list = seurat_sub
-unintegrated <- merge(seurat_list[[1]], seurat_list[2:9]) 
-unintegrated <- NormalizeData(unintegrated)
-unintegrated <- FindVariableFeatures(unintegrated)
-unintegrated <- ScaleData(unintegrated)
-unintegrated <- RunPCA(unintegrated)
-unintegrated <- FindNeighbors(unintegrated, dims = 1:30)
-unintegrated <- RunUMAP(unintegrated, dims = 1:30,reduction.name = "unintegrated")
-save(unintegrated,file = file.path('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu',   
-                       paste0("20250613_9CanPBMCobject_integratedObjDetails_","unIntegrated.Rdata")))
-					   
-load(file = file.path('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu',   
-                       paste0("20250613_9CanPBMCobject_integratedObjDetails_","unIntegrated.Rdata")))					   
-objIntegratedList = list()
-obj = unintegrated
-library(future)
-## Only the *outer* loop is parallel
-plan(multisession, workers = 8)          # outer level
-options(future.globals.maxSize = 25 * 1024^3)   # safety margin
-
-for (i in seq_along(integration_info)) {
-  res <- future({
-    red.use  <- integration_info[[i]]$reduction
-    clst.name <- integration_info[[i]]$cluster.name
-    method.use <- integration_info[[i]]$method.use
-    umap.reduction <- integration_info[[i]]$umap.reduction
-    print(method.use)
-
-    ## inner part runs sequentially to avoid huge export
-    plan(sequential)
-    objIntegrated <- IntegrateLayers(
-        object = obj,
-        method = method.use,
-        orig.reduction = "pca",
-        new.reduction = red.use,
-        verbose = FALSE
-    )
-    plan(sequential)
-    objIntegrated <- JoinLayers(objIntegrated)
-    objIntegrated <- FindNeighbors(objIntegrated, reduction = red.use, dims = 1:30)
-    objIntegrated <- RunUMAP(objIntegrated, reduction = red.use, dims = 1:30,
-                             reduction.name = umap.reduction)
-    save(objIntegrated,
-         file = file.path("/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu",
-                          sprintf("20250613_9CanPBMCobject_integratedObjDetails_%s_objIntegrated.Rdata",
-                                  method.use)))
-    objIntegrated
-  })
-  objIntegratedList[[integration_info[[i]]$method.use]] <- value(res)
-}
-save(objIntegratedList,file = file.path(projectPath, "Data",   
-                       paste0("20250613_9CanPBMCobject_integratedObjDetails_objIntegratedList.Rdata")))
-					   
-			
-
-######整合后的数据用不同Res进行降维聚类，进行ClusterTreePlot
-resolutions <-c(0.025, 0.05, 0.1, 0.15, 0.2, 0.25,0.3,0.35,0.4)  
-IntegrationObj = objIntegratedList[['HarmonyIntegration']]
-for (i in resolutions){
-  IntegrationObj = FindClusters(  
-    object     = IntegrationObj,  
-    resolution = i,  
-    algorithm  = 1 
-    #cluster.name = clst.name,
+  doublet_summary[[obj_name]] <- data.frame(
+    Sample       = obj_name,
+    Total_Cells  = total_cells,
+    Doublets     = doublet_count,
+    Doublet_Rate = doublet_rate,
+    Singlets_Kept= ncol(current_obj),
+    Best_pK      = pK,
+    stringsAsFactors = FALSE
   )
 }
-library(clustree)    # 提供 clustree()
-library(ggplot2)  
-umap_pdf <- file.path(projectPath, "IntegrationObj_Harmony_AllClusterTreeUMAP_Plots_.pdf")  
-pdf(umap_pdf, width = 10, height = 8) 
-#for(n in (1:length(seurat_list))) {
-  name = 'Harmony' #names(seurat_list[n])
-  current_obj =IntegrationObj
-  clustree_plot <- clustree(current_obj, prefix = "RNA_snn_res.") +  
-    ggtitle(paste0(name, " Clustering Tree")) +  
-    theme(plot.title = element_text(size = 14, face = "bold"))  
-  print(clustree_plot)
-  best_resolution = 'RNA_snn_res.0.2'
-  Idents(current_obj) = current_obj$RNA_snn_res.0.2
-  umap_plot <- DimPlot(  
-    current_obj,  
-    reduction = "umap.harmony",  
-    label = TRUE  
-  ) +  
-    ggtitle(paste0(name, " (Final resolution = ", best_resolution, ")"))  
-  print(umap_plot) 
 
-  umap_plot01 <- DimPlot(  
-    current_obj,  
-    reduction = "umap.harmony",
-    group.by = 'predicted.celltype.l1',	
-    label = TRUE  
+dev.off()
+message(paste("Doublet UMAP plots saved to:", umap_pdf))
+
+# 将 DoubletFinder 的摘要追加到 qc_summary_df 中
+# 假设 qc_summary_df 已经在你的工作区，且包含前面阶段的统计
+# 如果没有，可以先创建空的 qc_summary_df，然后用 rbind 添加
+if (!exists("qc_summary_df")) {
+  qc_summary_df <- data.frame(
+    Sample = character(),
+    Raw_Barcodes = integer(),
+    After_EmptyDrops = integer(),
+    Empty_Rate_Pct = numeric(),
+    Ambient_Method = character(),
+    Ambient_Rate_Pct = numeric(),
+    Cells_Before_QC = integer(),
+    Removed_LowFeature = integer(),
+    Removed_HighFeature = integer(),
+    Removed_LowCount = integer(),
+    Removed_HighMT = integer(),
+    Removed_HighHb = integer(),
+    Cells_After_QC = integer(),
+    Doublets = integer(),
+    Doublet_Rate = numeric(),
+    Singlets_Kept = integer(),
+    Best_pK = numeric(),
+    stringsAsFactors = FALSE
   )
-  print(umap_plot01) 
+}
+# 将当前阶段的 doublet_summary 合并到 qc_summary_df
+doublet_summary_df <- do.call(rbind, doublet_summary)
+rownames(doublet_summary_df) <- NULL
+
+# 合并 QC 和 Doublet 结果
+qc_doublet_merged <- qc_summary_df %>%
+  left_join(doublet_summary_df, by = "Sample")
   
-    umap_plot001 <- DimPlot(  
-    current_obj,  
-    reduction = "umap.harmony",
-    group.by = 'predicted.celltype.l2',	
-    label = TRUE  
-  )
-  print(umap_plot001)
-  
-    umap_plot0001 <- DimPlot(  
-    current_obj,  
-    reduction = "umap.harmony",
-    group.by = 'orig.ident',	
-    label = FALSE  
-  )
-  print(umap_plot0001)
-  
-#}
-dev.off()
-method.use='HarmonyIntegration'
-IntegrationObj = current_obj
-objIntegratedList[['HarmonyIntegration']] = IntegrationObj
-objIntegrated =current_obj
-save(objIntegrated,file = file.path('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu',   
-                       paste0("20250613_9CanPBMCobject_integratedObjDetails_",method.use,"_objIntegrated_FindClusters.Rdata")))
-
-
-######-------- 去死样本单独分析
-target_samples <- c(
-  "C6-2","D6-2","H9-2",         #FlowCytometryTreat
-  'B9','C9','D9','C6','D6','H9',   #KitTreat
-  'F9','G9','F6' ,"C6-1","D6-1" ,"H9-1"  # WithoutTreat
+# 保存 doublet 汇总
+write.csv(
+  qc_doublet_merged,
+  file.path(projectPath, "Output",
+            paste0(date_tag, "_QC_Doublet_Merged.csv")),
+  row.names = FALSE
 )
-B=load('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu/20250613_9CanPBMCobject_integratedObjDetails_HarmonyIntegration_objIntegrated_FindClusters.Rdata')
-Idents(objIntegrated) = 'RNA_snn_res.0.2'
-subObjIntegrated = subset(objIntegrated,idents = '7')
+message("\n========== Doublet Summary ==========")
+print(doublet_summary_df)
 
-A=load('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/Data/20250402_45CanPBMCobject_integratedObjDetails_HarmonyIntegration02.Rdata')
-Idents(seurat_obj) = 'orig.ident'
-subObject <- subset(seurat_obj, idents = target_samples)
+# 保存 DoubletFinder 后的对象
+n_samples_df <- length(seurat_list)
+save_file_df <- file.path(projectPath, "Data",
+                          make_filename(n_samples_df,
+                                        "AfterQC_AfterDoubletFinder",
+                                        prefix = "02_"))
+save(seurat_list, file = save_file_df)
 
-# 创建样本到处理类型的映射
-sample_treatment_mapping <- c(
-  "C6-2" = "FlowCytometryTreat",
-  "D6-2" = "FlowCytometryTreat", 
-  "H9-2" = "FlowCytometryTreat",
-  "B9" = "KitTreat",
-  "C9" = "KitTreat",
-  "D9" = "KitTreat",
-  "C6" = "KitTreat",
-  "D6" = "KitTreat",
-  "H9" = "KitTreat",
-  "F9" = "WithoutTreat",
-  "G9" = "WithoutTreat",
-  "F6" = "WithoutTreat",
-  "C6-1" = "WithoutTreat",
-  "D6-1" = "WithoutTreat",
-  "H9-1" = "WithoutTreat"
-)
-
-# 添加新的 metadata 列
-subObject$Treatment <- data.frame(sample_treatment_mapping[subObject$orig.ident])[,1]
+message(sprintf("\nProcess Complete! Final list saved to: %s", save_file_df))
+message(sprintf("Summary table saved to: %s", final_output_path))
 
 
+# ============================================================
+# 3. 合并样本（未整合）
+# ============================================================
+if (length(seurat_list) > 1) {
+  unintegrated <- merge(seurat_list[[1]],
+                        y = seurat_list[2:length(seurat_list)],
+                        project = "Merged_Unintegrated")
+} else {
+  unintegrated <- seurat_list[[1]]
+}
 
+unintegrated <- unintegrated %>%
+  NormalizeData(verbose = FALSE) %>%
+  FindVariableFeatures(verbose = FALSE) %>%
+  ScaleData(verbose = FALSE) %>%
+  RunPCA(verbose = FALSE, seed.use = 42) %>%
+  FindNeighbors(dims = PC_DIMS) %>%
+  RunUMAP(dims = PC_DIMS, reduction.name = "umap_unintegrated", seed.use = 42)
 
+p_unintegrated <- DimPlot(unintegrated, reduction = "umap_unintegrated",
+                          group.by = "orig.ident") +
+  ggtitle("Unintegrated UMAP")
+ggsave(file.path(projectPath, "Output", "Unintegrated_UMAP_by_sample.png"),
+       plot = p_unintegrated, width = 10, height = 8, dpi = 300)
 
+save(unintegrated,
+     file = file.path(projectPath, "Data", "03_2021216_Samples_MergedObj_Unintegrated.Rdata"))
 
+message("\n========================================")
+message("Pipeline completed successfully!")
+message("========================================")
 
+# ============================================================
+# 3. 细胞周期评分（Cell Cycle Scoring）
+# ============================================================
+# 注意：Seurat 自带的是人类基因名
+# 犬的基因名通常也是大写（和人一样），所以可以直接用
 
+# Seurat 内置的 S 期和 G2M 期基因
+s.genes   <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
 
+# 检查基因名匹配情况（犬的基因名可能有部分不匹配）
+for (obj_name in names(seurat_list)) {
+  current_obj <- seurat_list[[obj_name]]
 
+  # 查看匹配率
+  s_matched   <- intersect(s.genes,   rownames(current_obj))
+  g2m_matched <- intersect(g2m.genes, rownames(current_obj))
+  message(sprintf("  [%s] Cell cycle genes: S-phase %d/%d matched, G2M %d/%d matched",
+                  obj_name,
+                  length(s_matched),   length(s.genes),
+                  length(g2m_matched), length(g2m.genes)))
 
+  # 评分
+  current_obj <- NormalizeData(current_obj, verbose = FALSE)
+  current_obj <- CellCycleScoring(current_obj,
+                                   s.features   = s.genes,
+                                   g2m.features = g2m.genes,
+                                   set.ident    = FALSE)
 
+  # 查看分布
+  cc_table <- table(current_obj$Phase)
+  message(sprintf("  [%s] Cell cycle: G1=%d, S=%d, G2M=%d",
+                  obj_name,
+                  cc_table["G1"], cc_table["S"], cc_table["G2M"]))
 
+  # 可视化
+  p_cc <- DimPlot(current_obj %>%
+                    RunUMAP(dims = PC_DIMS, verbose = FALSE, seed.use = 42),
+                  group.by = "Phase",
+                  cols = c("G1" = "#E8E8E8", "S" = "#2196F3", "G2M" = "#FF5722")) +
+    ggtitle(paste0(obj_name, ": Cell Cycle Phase"))
+  ggsave(file.path(projectPath, "Output","CellCycle",
+                   paste0(obj_name, "_CellCycle_UMAP.png")),
+         plot = p_cc, width = 9, height = 7, dpi = 300)
 
+  # S.Score 和 G2M.Score 的小提琴图
+  p_cc_vln <- VlnPlot(current_obj,
+                       features = c("S.Score", "G2M.Score"),
+                       pt.size = 0, ncol = 2) +
+    plot_annotation(title = paste0(obj_name, ": Cell Cycle Scores"))
+  ggsave(file.path(projectPath, "Output", "CellCycle",
+                   paste0(obj_name, "_CellCycle_VlnPlot.png")),
+         plot = p_cc_vln, width = 10, height = 5, dpi = 300)
 
-###  Seurat转换格式成Scanpy				   
-library(SeuratDisk)  ###SaveH5Seurat-Convert ,but somewhere wrong 
-#SaveH5Seurat(unintegrated, filename=file.path(projectPath, "Data", "20250526_3SamplesMSC_ObjectOriginal_AfterDoubletsScaleCellCircle_unintegrated.h5Seurat"))   报错
-#Convert(file.path(projectPath, "Data", paste0("20250526_3SamplesMSC_ObjectOriginal_AfterDoubletsScaleCellCircle_unintegrated.h5Seurat")),                               报错
-#        dest="h5ad", overwrite=TRUE) 
+  seurat_list[[obj_name]] <- current_obj
+}
 
-load(file.path('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu',   
-                       paste0("20250613_9CanPBMCobject_ALL.IntegratioMethods_objIntegratedList.Rdata")))
+# 保存包含细胞周期信息的对象
+save_file_cc <- file.path(projectPath, "Data",
+                          make_filename(length(seurat_list),
+                                        "AfterQC_DF_CellCycle",
+                                        prefix = "03_"))
+save(seurat_list, file = save_file_cc)
+message(sprintf("Saved with cell cycle -> %s", save_file_cc))
 
-Usedreductions <- data.frame(vapply(objIntegratedList, function(obj) tail(Seurat::Reductions(obj), 1), character(1)))
-projectPath = '/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu'
-library(Matrix)
-library(Matrix.utils)
-samples = names(objIntegratedList)
-for (ss in (1:length(names(objIntegratedList)))){
-  s = names(objIntegratedList)[ss]
-  redutionUsed = Usedreductions[ss,1]
-  seu = objIntegratedList[[s]]
-  seu$barcode <- colnames(seu)
-  #seu$UMAP_1 <- seu@reductions$umap@cell.embeddings[,1]
-  #seu$UMAP_2 <- seu@reductions$umap@cell.embeddings[,2]
-  write.csv(seu@meta.data, file=file.path(projectPath, paste0("20250613_9CanPBMCobject_integratedObjDetails_",s,"_metadata.csv")), 
-      quote=F, row.names=F)
-  # write expression counts matrix
-  seu = JoinLayers(seu)
-  counts_matrix <- GetAssayData(seu[['RNA']], layer='counts')   # slot = counts, data, scale.data
-  writeMM(counts_matrix, file=file.path(projectPath, paste0("20250613_9CanPBMCobject_integratedObjDetails_",s,"_counts.mtx")))
-  # write gene names
-  write.csv(data.frame('gene'=rownames(counts_matrix)),
-             file=file.path(projectPath,  paste0("20250613_9CanPBMCobject_integratedObjDetails_",s,"_geneNames.csv")),
-	         quote=F,row.names=F,col.names=F)
-  # write dimesnionality reduction matrix, in this example case pca matrix
-  #write.csv(seu@reductions$pca@cell.embeddings, 
-  #          file=file.path(projectPath, paste0("20250613_9CanPBMCobject_integratedObjDetails_",s,"_pca.csv")), 
-  #	   	    quote=F, row.names=F)
-  write.csv( Embeddings(seu, reduction = redutionUsed), 
-            file=file.path(projectPath, paste0( "20250613_9CanPBMCobject_integratedObjDetails_",s,"_UMAP.csv")), 
-	    	quote=F, row.names=F)
-} 
- 
-###Python: Scanpy-AnnData, save as h5ad
-import scanpy as sc
-import anndata
-from scipy import io
-from scipy.sparse import coo_matrix, csr_matrix
-import numpy as np
-import os
-import pandas as pd
-projectPath = '/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu'
+# ============================================================
+# 4. 基因级过滤（可选但推荐）
+# ============================================================
+# 去除只在极少细胞中表达的基因
+MIN_CELLS_PER_GENE <- 3
 
+for (obj_name in names(seurat_list)) {
+  current_obj <- seurat_list[[obj_name]]
+  genes_before <- nrow(current_obj)
 
-for ss in 0:len(samples):
-	s = samples[ss]
-	redusd = redutionUsed[ss]
-	# load sparse matrix:
-	X = io.mmread(''.join([pathTemp, s,"_counts.mtx"]))
-	# create anndata object
-	adata = anndata.AnnData(X=X.transpose().tocsr())
-	# load cell metadata:
-	cell_meta = pd.read_csv(''.join([pathTemp, s,"_metadata.csv"]))
-	# load gene names:
-	with open(''.join([pathTemp, s,"._geneNames.csv"]), 'r') as f:
-		gene_names = f.read().splitlines()
-	# set anndata observations and index obs by barcodes, var by gene names
-	adata.obs = cell_meta
-	adata.obs.index = adata.obs['barcode']
-	adata.var.index = gene_names
-	# load dimensional reduction:
-	pca = pd.read_csv(''.join([pathTemp, s,"_UMAP.csv"]))
-	pca.index = adata.obs.index
-	# set pca and umap
-	adata.obsm[redusd] = pca.to_numpy()
-	#adata.obsm['X_umap'] = np.vstack((adata.obs['UMAP_1'].to_numpy(), adata.obs['UMAP_2'].to_numpy())).T
-	# plot a UMAP colored by sampleID to test:
-	#sc.pl.umap(adata, color=['seurat_clusters'], frameon=False, save=True)
-	# save dataset as anndata format
-	adata.write(''.join([pathTemp, s,".h5ad"]))
-	# reload dataset
-	#adata = sc.read_h5ad(''.join([pathTemp, s,".h5ad"]))			   
-import os
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import anndata as ad
-from scipy import io      # io.mmread
-samples = ['20250613_9CanPBMCobject_integratedObjDetails_CCAIntegration',
-'20250613_9CanPBMCobject_integratedObjDetails_RPCAIntegration', 
-'20250613_9CanPBMCobject_integratedObjDetails_HarmonyIntegration', 
-'20250613_9CanPBMCobject_integratedObjDetails_FastMNNIntegration', 
-'20250613_9CanPBMCobject_integratedObjDetails_JointPCAIntegration',
-'20250613_9CanPBMCobject_integratedObjDetails_Unintegrated']
-path_temp = '/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu'
-redutionUsed = ['CCA','RPCA','Harmony','FastMNN','JointPCA','Unintegrated']
+  # 统计每个基因在多少个细胞中表达
+  gene_cell_counts <- Matrix::rowSums(GetAssayData(current_obj, slot = "counts") > 0)
+  genes_keep <- names(gene_cell_counts[gene_cell_counts >= MIN_CELLS_PER_GENE])
 
-for sample, red_key in zip(samples, redutionUsed):
-    # ---------- 1. 读表达矩阵 (cells × genes) ----------
-    mtx_path = os.path.join(path_temp, f"{sample}_counts.mtx")
-    X = io.mmread(mtx_path).tocsr().T      # 转置后就是 cells × genes
-    # ---------- 2. 读基因名 ----------
-    gene_path = os.path.join(path_temp, f"{sample}_geneNames.csv")
-    gene_names = pd.read_csv(gene_path, header=None,skiprows=1).iloc[:, 0].tolist()
-    # ---------- 3. 读细胞元数据 ----------
-    meta_path = os.path.join(path_temp, f"{sample}_metadata.csv")
-    cell_meta = pd.read_csv(meta_path)
-    # 核对维度
-    if X.shape[0] != cell_meta.shape[0]:
-        raise ValueError(f"{sample}: cell number mismatch "
-                         f"({X.shape[0]} in mtx vs {cell_meta.shape[0]} in metadata)")
-    if X.shape[1] != len(gene_names):
-        raise ValueError(f"{sample}: gene number mismatch "
-                         f"({X.shape[1]} in mtx vs {len(gene_names)} in gene list)")
-    # ---------- 4. 创建 AnnData ----------
-    adata = ad.AnnData(
-        X,
-        obs = cell_meta.set_index("barcode"),
-        var = pd.DataFrame(index = gene_names)
-    )
-    # ---------- 5. 读 UMAP / PCA 坐标 ----------
-    emb_path = os.path.join(path_temp, f"{sample}_UMAP.csv")
-    emb = (
-        pd.read_csv(emb_path)
-          .set_index("barcode")            # 假设第一列就是 barcode
-          .loc[adata.obs_names]            # 顺序对齐 AnnData
-          .to_numpy()
-    )
-    adata.obsm[red_key] = emb             # 例如 red_key = "X_umap"
-    # ---------- 6. 保存 .h5ad ----------
-    out_path = os.path.join(path_temp, f"{sample}.h5ad")
-    adata.write(out_path)
-    print(f"✓  {sample} saved to {out_path}")					   
-	
-	
+  current_obj <- subset(current_obj, features = genes_keep)
+  genes_after <- nrow(current_obj)
 
-##############################################
-###########   占比变化
-##############################################
+  message(sprintf("  [%s] Gene filtering: %d -> %d genes (removed %d)",
+                  obj_name, genes_before, genes_after, genes_before - genes_after))
 
-projectPath = '/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu'
+  seurat_list[[obj_name]] <- current_obj
+}
 
-seurat_obj = objIntegrated
-type = 'RNA_snn_res.0.2'  #'predicted.celltype.l2'#'seurat_clusters'  #SingleR_Labels
-Idents(seurat_obj) = seurat_obj@meta.data[[type]]
-#  生成对应向量
-treat_vec <- ifelse(
-  grepl("-1$", seurat_obj$orig.ident),          # 末尾 -1
-  "WithoutTreat",
-  ifelse(
-    grepl("-2$", seurat_obj$orig.ident),        # 末尾 -2
-    "FlowCytometryTreat",
-    "KitTreat"                                  # 剩余即为 C6 / D6 / H9
-  )
-)
-#  加入 meta.data
-seurat_obj <- AddMetaData(
-  object   = seurat_obj,
-  metadata = treat_vec,
-  col.name = "TreatmentDeadCelles"
-)
-sampleInfo = cbind(seurat_obj$orig.ident,seurat_obj$TreatmentDeadCelles)
-colnames(sampleInfo) <- c("Samples","ControlTreatment0102")
-sampleInfo <- unique(sampleInfo) 
-objIntegrated = seurat_obj
-save(objIntegrated,
-				file='/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu/20250613_9CanPBMCobject_integratedObjDetails_HarmonyIntegration_objIntegrated_FindClusters.Rdata')
-objIntegratedList[['HarmonyIntegration']] = objIntegrated
-save(objIntegratedList,file = file.path(projectPath, "Data",   
-                       paste0("20250613_9CanPBMCobject_integratedObjDetails_objIntegratedList.Rdata")))
-	
+# ============================================================
+# 5. 合并所有样本（未整合）
+# ============================================================
+if (length(seurat_list) > 1) {
+  merged_obj <- merge(seurat_list[[1]],
+                      y = seurat_list[2:length(seurat_list)],
+                      add.cell.ids = names(seurat_list),
+                      project = "Merged_AllSamples")
+} else {
+  merged_obj <- seurat_list[[1]]
+}
 
-#################################################################
-# 确保加载所需的包  
-library(Seurat)  
-library(dplyr)  
-library(tidyr) 
-library(rstatix)  
-library(ggplot2)  
-library(tibble)      # 新增这行
-library(ggplot2)
-library(ggpubr)
-# 计算细胞簇在不同样本中的比例 
-type = 'seurat_clusters'
-celltype_prop <- prop.table(table(seurat_obj@meta.data[[type]], seurat_obj$orig.ident), margin = 2)  
-# 将宽格式转换为长格式  
-celltype_prop_wide <- as.data.frame.matrix(celltype_prop) %>%   
-  rownames_to_column("Cluster")  
-celltype_prop_long <- celltype_prop_wide %>%   
-  pivot_longer(cols = -Cluster, names_to = "Sample", values_to = "Proportion")  
-# 合并样本信息  
-merged_data <- merge(celltype_prop_long, sampleInfo, by.x = "Sample", by.y = "Samples")  
-# 创建统一分组并转化为因子  
-#merged_data$Group <- factor(ifelse(merged_data$ControlTreatment == "Control", "Control", "Treatment"))  
-merged_data$Group <- factor(merged_data$ControlTreatment0102)
-#merged_data$Group <- factor(merged_data$ControlTreatment)
+message(sprintf("Merged object: %d cells x %d genes", ncol(merged_obj), nrow(merged_obj)))
 
-# 统计检验  
-mw_results <- merged_data %>%  
-  group_by(Cluster) %>%  
-  wilcox_test(Proportion ~ Group) %>%  
-  adjust_pvalue(method = "BH") %>%  
-  add_significance()  
-# 可视化  
-print(head(merged_data))  # 打印检查 merged_data 的结构和数据  
-print(mw_results)          # 打印检查 mw_results 的结构和数据  
-###  Control   Treatment(Treatment01+Treatment02)
-# 创建带有显著性标注的箱线图
-p = ggplot(merged_data, aes(x = Group, y = Proportion, fill = Group)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(width = 0.2, alpha = 0.5) +
-  facet_wrap(~ Cluster, scales = "free_y", nrow = 2) +
-  # 添加显著性标注
-  stat_compare_means(
-    method = "wilcox.test",
-    comparisons = list(c("Control", "Treatment")),
-    label = "p.signif",
-    method.args = list(alternative = "two.sided")
-  ) +
-  scale_fill_manual(values = c("Control" = "grey50", "Treatment" = "#E69F00")) +
-  theme_bw() +
-  labs(x = "Treatment Group", y = "Proportion",
-       title = "Cluster Proportions Across Treatment Groups")
-#pdf(file.path(projectPath, "Output", paste0("45CanPBMCobject_SeuratIntegratedMethods_UMAP_",method.use,"_Proportions__",type,".pdf")),width=15)
-pdf(file.path(projectPath, "Output", paste0("45CanPBMCobject_SeuratIntegratedMethods_UMAP_",method.use,"_ReCluster2.Proportions_",type,"ControlTreatment.pdf")),width=15)
-print (p)
+# ============================================================
+# 6. 合并后整体 QC 对比可视化
+# ============================================================
+# 按样本对比各 QC 指标
+# 假设 merged_obj 已经存在，date_tag、projectPath、Outputs 路径等也已设置
+
+# 要输出的特征列表，逐个输出到同一个 PDF 的单独页面
+features_to_plot <- c("nFeature_RNA", "nCount_RNA",
+                      "percent.mt", "percent.hb",
+                      "percent.ribo", "log10GenesPerUMI")
+# 输出 PDF，每页一个特征
+pdf_file <- file.path(projectPath, "Output",
+                      paste0(date_tag, "_MergedSamples_QC_Comparison_PerFeature.pdf"))
+# 打开 PDF 设备
+pdf(pdf_file, width = 10, height = 6)
+for (feat in features_to_plot) {
+  p <- VlnPlot(merged_obj,
+               features = feat,
+               group.by = "orig.ident",
+               pt.size = 0) +
+       ggtitle(paste0("QC Metric: ", feat)) +
+       NoLegend()
+  print(p)  # 每次在同一 PDF 的新页输出
+}
 dev.off()
+message(sprintf("Saved per-feature ViolinPlots to: %s", pdf_file))
 
-###  Control   Treatment01    Treatment02
-# 可视化  
-p0102=ggplot(merged_data, aes(x = Group, y = Proportion, fill = Group)) +  
-  geom_boxplot(outlier.shape = NA) +  
-  geom_jitter(width = 0.2, alpha = 0.5) +  
-  facet_wrap(~ Cluster, scales = "free_y", nrow = 2) +  
-  stat_compare_means(  
-    comparisons = list(  
-      c("WithoutTreat", "FlowCytometryTreat"),  #c("Control", "Treatment01"),  
-      c("WithoutTreat", "KitTreat"),  #c("Control", "Treatment02"),  
-      c("FlowCytometryTreat", "KitTreat")#c("Treatment01", "Treatment02")  
-    ),  
-    method = "wilcox.test",  
-    label = "p.signif"  
-  ) +  
-  scale_fill_manual(values = c("WithoutTreat" = "grey50",       #"Control" = "grey50",   
-                               "FlowCytometryTreat" = "#E69F00",#"Treatment01" = "#E69F00",   
-                               "KitTreat" = "#56B4E9"           #"Treatment02" = "#56B4E9"
-							   )) +  
-  theme_bw() +  
-  labs(x = "Treatment Group", y = "Proportion",  
-       title = "Cluster Proportions Across Treatment Groups")  
-pdf(file.path(projectPath, paste0("20250613_9CanPBMCobject_HarmonyIntegration.Proportions_",type,"ControlTreatment0102.pdf")),width=25,height=10)
-print (p0102)
-dev.off()
+# ---------- 未整合 UMAP ----------
+merged_obj <- merged_obj %>%
+  NormalizeData(verbose = FALSE) %>%
+  FindVariableFeatures(verbose = FALSE) %>%
+  ScaleData(verbose = FALSE) %>%
+  RunPCA(verbose = FALSE, seed.use = 42) %>%
+  FindNeighbors(dims = PC_DIMS, verbose = FALSE) %>%
+  RunUMAP(dims = PC_DIMS, reduction.name = "umap_unintegrated", seed.use = 42)
 
+p_unintegrated <- DimPlot(merged_obj, reduction = "umap_unintegrated",
+                          group.by = "orig.ident") +
+  ggtitle("Unintegrated UMAP (All Samples)")
+ggsave(file.path(projectPath, "Output",
+                 paste0(date_tag, "_Unintegrated_UMAP.png")),
+       plot = p_unintegrated, width = 10, height = 8, dpi = 300)
 
-########### 
-library(SCP)
-load('/mnt2/wanggd_group/zjj/BGCscRNA/ZengMin/XiaoLu/20250613_9CanPBMCobject_integratedObjDetails_HarmonyIntegration_objIntegrated_FindClusters.Rdata')
+# 保存合并对象
+save_file_merged <- file.path(projectPath, "Data",
+                              make_filename(length(seurat_list),
+                                            "Merged_Unintegrated",
+                                            prefix = "04_"))
+save(merged_obj, file = save_file_merged)
+message(sprintf("Saved merged object -> %s", save_file_merged))
 
-objIntegrated = subObject
-objIntegrated$TreatmentDeadCelles = subObject$Treatment
-
-Idents(objIntegrated) = objIntegrated$TreatmentDeadCelles
-objIntegrated$harmony_clusters<-factor(x=objIntegrated$harmony_clusters,c("0","1","2","3","4","5","6","7","8"))
-
-sub01_objIntegrated = subset(objIntegrated,ident = c('WithoutTreat','KitTreat'))
-sub02_objIntegrated = subset(objIntegrated,ident = c('WithoutTreat','FlowCytometryTreat'))
-pdf(file.path(projectPath, "IntegrationObj_Harmony_ZhanBi_Plots_.pdf") )
-p1=CellStatPlot(objIntegrated, stat.by = "RNA_snn_res.0.2", group.by = "TreatmentDeadCelles", plot_type = "trend")
-print(p1)
-Idents(objIntegrated) = objIntegrated$orig.ident
-sub001_objIntegrated = subset(objIntegrated,ident = c("C6-1","C6","C6-2"))
-sub002_objIntegrated = subset(objIntegrated,ident = c("D6-1","D6","D6-2"))
-sub003_objIntegrated = subset(objIntegrated,ident = c("H9-1","H9","H9-2"))
-p2=CellStatPlot(sub001_objIntegrated, stat.by = "RNA_snn_res.0.2", group.by = "orig.ident", plot_type = "trend")
-print(p2)
-
-p3=CellStatPlot(sub002_objIntegrated, stat.by = "RNA_snn_res.0.2", group.by = "orig.ident", plot_type = "trend")
-print(p3)
-
-p4=CellStatPlot(sub003_objIntegrated, stat.by = "RNA_snn_res.0.2", group.by = "orig.ident", plot_type = "trend")
-print(p4)
-dev.off()
-
-
-45CanPBMCobject_SeuratIntegratedMethods_UMAP_HarmonyIntegration_Proportions_SingleR_LabelsTreat0102
-
-pdf(file.path(projectPath, paste0("45CanPBMCobject_SeuratIntegratedMethods_UMAP_HarmonyIntegration_Proportions_SingleR_LabelsTreat0102.pdf")),width=15)
-print (p0102)
-dev.off()
+# ============================================================
+# ★ 最终 Pipeline 完成
+# ============================================================
+message("\n========================================")
+message("★ Complete QC Pipeline Finished!")
+message("========================================")
+message(sprintf("Date: %s", Sys.Date()))
+message(sprintf("Samples processed: %d", length(seurat_list)))
+message(sprintf("Final merged: %d cells x %d genes", ncol(merged_obj), nrow(merged_obj)))
+message("\nSaved files:")
+message(sprintf("  01a: %s (before QC)", basename(save_file_raw)))
+message(sprintf("  01b: %s (after QC)", basename(save_file_filtered)))
+message(sprintf("  02:  %s (after DoubletFinder)", basename(save_file_df)))
+message(sprintf("  03:  %s (with CellCycle)", basename(save_file_cc)))
+message(sprintf("  04:  %s (merged)", basename(save_file_merged)))
+message("========================================")
