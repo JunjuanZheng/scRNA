@@ -51,12 +51,12 @@ message(sprintf("Date tag: %s", date_tag))
 # 2. 核心参数集中管理（修正原代码重复赋值/语法错误）
 # ==============================================
 # QC阈值
-MIN_FEATURES <- 200
+MIN_FEATURES <- 500
 MAX_FEATURES <- 5000
-MAX_MT_PERCENT <- 20
+MAX_MT_PERCENT <- 10
 MAX_HB_PERCENT <- 5
-MIN_COUNTS <- 500
-MIN_NOVELTY <- 0.8
+MIN_COUNTS <- 1000
+MIN_NOVELTY <- 0.85
 # 降维聚类参数
 PC_DIMS <- 1:20
 CLUSTER_RESOLUTIONS <- seq(0.1, 1, by = 0.05) # 多分辨率梯度
