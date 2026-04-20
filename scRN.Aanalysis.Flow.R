@@ -538,6 +538,7 @@ message(paste("Doublet UMAP plots saved to:", umap_pdf))
 
 # 双细胞结果汇总与保存
 doublet_summary_df <- do.call(rbind, doublet_summary)
+qc_summary_df <- as.data.frame(qc_summary_df)
 rownames(doublet_summary_df) <- NULL
 qc_doublet_merged <- qc_summary_df %>% left_join(doublet_summary_df, by = "Sample")
 write.csv(qc_doublet_merged, file.path(projectPath, "Output", paste0(date_tag, "_QC_Doublet_Merged.csv")), row.names = FALSE)
@@ -614,6 +615,9 @@ for (obj_name in names(seurat_list)) {
                   obj_name, genes_before, genes_after, genes_before - genes_after))
   seurat_list[[obj_name]] <- current_obj
 }
+save_file_cc <- file.path(projectPath, "Data", make_filename(length(seurat_list), "AfterQC_DF_CellCycle_GenesFiltered", prefix = "04_"))
+save(seurat_list, file = save_file_cc)
+message(sprintf("Saved with cell cycle -> %s", save_file_cc))
 
 # ==============================================
 # ========== 新增核心流程开始 ==========
@@ -661,6 +665,73 @@ p_unintegrated <- DimPlot(merged_obj, reduction = "umap_unintegrated", group.by 
 ggsave(file.path(projectPath, "Output", "HarmonyIntegration", paste0(date_tag, "_Unintegrated_UMAP.png")),
        plot = p_unintegrated, width = 10, height = 8, dpi = 300)
 
+# ============================================================
+# 合并后整体 QC 对比可视化
+# ============================================================
+# 按样本对比各 QC 指标
+# 假设 merged_obj 已经存在，date_tag、projectPath、Outputs 路径等也已设置
+# 要输出的特征列表，逐个输出到同一个 PDF 的单独页面
+library(Seurat)
+library(ggplot2)
+library(RColorBrewer)
+# 1. 准备颜色方案 
+# 如果样本数超过12个，Set3 或 Paired 会循环使用，颜色更温和
+sample_count <- length(unique(merged_obj$orig.ident))
+my_colors <- colorRampPalette(brewer.pal(12, "Paired"))(sample_count)
+# 设置输出路径
+pdf_file <- file.path(projectPath, "Output", 
+                      paste0(date_tag, "_Final_QC_Report.pdf"))
+pdf(pdf_file, width = 16, height = 8)
+# --- 第一部分：优化后的小提琴图 (温和配色) ---
+features_to_plot <- c("nFeature_RNA", "nCount_RNA", "percent.mt", 
+                      "percent.hb", "percent.ribo", "log10GenesPerUMI")
+for (feat in features_to_plot) {
+  p <- VlnPlot(merged_obj, 
+               features = feat, 
+               group.by = "orig.ident", 
+               pt.size = 0, # 必须为0，否则点太多会黑乎乎一片
+               cols = my_colors) +
+    theme_bw() + # 使用带网格的白色背景，更专业
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+      panel.grid.major.x = element_blank(), # 关闭垂直网格线，减少晃眼感
+      legend.position = "none"
+    ) +
+    labs(x = "Sample ID", y = feat) +
+    ggtitle(paste0("Refined QC: ", feat))
+  print(p)
+}
+# --- 第二部分：散点图与阈值标记 ---
+# 设定建议的阈值（请根据您的具体数据调整这些数值）
+thresh_min_nFeature <- 500
+thresh_max_nFeature <- 4000
+thresh_max_mt <- 15  # 假设 15% 为线粒体上限
+# nFeature vs nCount
+p1 <- FeatureScatter(merged_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", 
+                     group.by = "orig.ident", pt.size = 0.5) +
+      scale_color_viridis(discrete = TRUE, alpha = 0.3) +
+      geom_hline(yintercept = c(thresh_min_nFeature, thresh_max_nFeature), 
+                 linetype = "dashed", color = "red") +
+      theme(legend.position = "none") +
+      ggtitle("Cell Quality: nFeature vs nCount")
+
+# nFeature vs percent.mt
+p2 <- FeatureScatter(merged_obj, feature1 = "nFeature_RNA", feature2 = "percent.mt", 
+                     group.by = "orig.ident", pt.size = 0.5) +
+      scale_color_viridis(discrete = TRUE, alpha = 0.3) +
+      geom_hline(yintercept = thresh_max_mt, linetype = "dashed", color = "red") +
+      geom_vline(xintercept = c(thresh_min_nFeature, thresh_max_nFeature), 
+                 linetype = "dashed", color = "red") +
+      theme(legend.position = "none") +
+      ggtitle("Cell Quality: nFeature vs Mitochondrial %")
+
+# 打印散点图
+print(p1)
+print(p2)
+dev.off()
+message(sprintf("Refined QC plots and Scatter plots saved to: %s", pdf_file))
+
+    
 # ======================
 # 核心：Harmony整合（按orig.ident去除批次效应）
 # ======================
@@ -725,11 +796,11 @@ ggsave(file.path(projectPath, "Output", "Clustering", paste0(date_tag, "_Clustre
 # 方法2：轮廓系数评估聚类质量
 # ======================
 # 提取Harmony降维矩阵
-harmony_emb <- Embeddings(merged_obj, "harmony")[, PC_DIMS]
+harmony_embeddings <- Embeddings(merged_obj, "harmony")[, PC_DIMS]
 dist_matrix <- dist(harmony_embeddings)  
 sil_scores <- data.frame(Resolution = numeric(), Mean_Silhouette = numeric(),  
                           N_Clusters = integer())  
-for (res in resolution_range) {  
+for (res in CLUSTER_RESOLUTIONS) {  
   col_name <- paste0("RNA_snn_res.", res)  
   clusters <- as.integer(merged_obj@meta.data[[col_name]])  
   n_clust  <- length(unique(clusters))  
@@ -1109,33 +1180,75 @@ message("========================================")
 # ★★★ 以下 marker 基因为人类常见类型示例 ★★★  
 # ★★★ 请根据你的实际物种和组织替换 ★★★  
 canonical_markers <- list(
-  # ===== T 细胞大类 =====
-  "T cells"          = c("CD3D", "CD3E", "CD3G", "CD2", "TRAC", "TRBC1", "TRBC2", "CD28"),
-  # ===== CD4+ T 细胞亚群 =====
-  "CD4+ T naive"     = c("CD4", "IL7R", "CCR7", "LEF1", "TCF7", "SELL", "CD27", "CD28"),
-  "CD4+ T memory"    = c("CD4", "IL7R", "S100A4", "ANXA1", "IL32", "GPR183", "CD69", "AQP3"),
-  "Treg"             = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "IKZF2", "TNFRSF18", "TNFRSF4", "BATF"),
-  # ===== CD8+ T 细胞亚群 =====
-  "CD8+ T naive"     = c("CD8A", "CD8B", "CCR7", "LEF1", "TCF7", "SELL", "S1PR1", "LDHB"),
-  "CD8+ T effector"  = c("CD8A", "CD8B", "GZMA", "GZMK", "GZMB", "PRF1", "NKG7", "IFNG"),
-  # ===== NK 细胞 =====
-  "NK cells"         = c("NKG7", "GNLY", "KLRD1", "KLRB1", "KLRF1", "NCAM1", "FCGR3A", "GZMB"),
-  # ===== B 细胞亚群 =====
-  "B cells naive"    = c("CD79A", "CD79B", "MS4A1", "CD19", "IGHD", "IGHM", "TCL1A", "FCER2"),
-  "B cells memory"   = c("CD79A", "CD79B", "MS4A1", "CD19", "CD27", "AIM2", "TNFRSF13B", "IGHG1"),
-  "Plasma cells"     = c("JCHAIN", "MZB1", "SDC1", "IGHG1", "IGHG2", "XBP1", "PRDM1", "IRF4"),
-  # ===== 单核细胞亚群 =====
-  "CD14+ Monocytes"  = c("CD14", "LYZ", "S100A8", "S100A9", "S100A12", "VCAN", "FCN1", "CD36"),
-  "CD16+ Monocytes"  = c("FCGR3A", "MS4A7", "LST1", "LILRB2", "IFITM3", "AIF1", "CDKN1C", "MTSS1"),
-  # ===== 树突状细胞亚群 =====
-  "cDC (myeloid DC)"  = c("FCER1A", "CD1C", "CLEC10A", "HLA-DQA1", "HLA-DPB1", "ITGAX", "CD1E", "FCER1G"),
-  "pDC (plasmacytoid)" = c("LILRA4", "IRF7", "CLEC4C", "IL3RA", "GZMB", "ITM2C", "PLD4", "JCHAIN"),
-  # ===== 巨核细胞/血小板 =====
-  "Platelets"        = c("PPBP", "PF4", "GP9", "ITGA2B", "TUBB1", "TREML1", "CAVIN2", "CMTM5"),
-  # ===== 造血干/祖细胞 =====
-  "HSPC"             = c("CD34", "CRHBP", "SPINK2", "HOPX", "AVP", "CYTL1", "MLLT3", "HLF")
+  # ==================== 总T细胞 ====================
+  "T cells"                = c("CD3D", "CD3E", "CD3G", "CD2", "TRAC", "TRBC1", "TRBC2", "CD28", "TRAT1"),
+  # ==================== 幼稚T细胞（共同标记） ====================
+  "Naive T cells"    = c("CCR7", "SELL", "LEF1", "TCF7", "IL7R"),  
+
+  # ==================== CD4+ T细胞亚群 ==================== 
+  "CD4+ T naive"          = c("CD4", "CCR7", "SELL", "LEF1", "TCF7", "IL7R", "CD27", "CD28"),                     #CD4+ 幼稚T（核心：CD4 + naive标记）
+  "CD4+ T memory"          = c("CD4", "IL7R", "S100A4", "ANXA1", "IL32", "GPR183", "CD69", "AQP3", "ITGB1"),
+  "CD4+ T effector"        = c("CD4", "GZMA", "IFNG", "TNF", "CTLA4", "LAG3", "NKG7", "PRF1", "TBX21"),
+  #"Treg (调节性T)"         = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "IKZF2", "TNFRSF18", "TNFRSF4", "BATF", "LRRC32"),
+  #"Th1 cells"              = c("CD4", "TBX21", "IFNG", "CXCR3", "IL12RB2", "TNF", "IL2", "STAT4", "CCR5"),
+  #"Th2 cells"              = c("CD4", "GATA3", "IL4", "IL5", "IL13", "CCR4", "CRTH2", "STAT6", "IL17RB"),
+  #"Th17 cells"             = c("CD4", "RORC", "IL17A", "IL17F", "CCR6", "IL23R", "STAT3", "RORA", "CD161"),
+  # ==================== CD8+ T细胞亚群 ====================
+  "CD8+ T naive"           = c("CD8A", "CD8B", "CCR7", "SELL", "LEF1", "TCF7", "IL7R", "S1PR1"),                  # CD8+ 幼稚T（核心：CD8A/B + naive标记）
+  "CD8+ T memory"          = c("CD8A", "CD8B", "IL7R", "CD27", "CD28", "GZMK", "ITGA1", "S100A4", "EOMES"),
+  "CD8+ T effector"        = c("CD8A", "CD8B", "GZMA", "GZMK", "GZMB", "PRF1", "NKG7", "IFNG", "TBX21"),
+  "CD8+ T exhausted"       = c("CD8A", "PDCD1", "LAG3", "TIGIT", "HAVCR2", "CTLA4", "ENTPD1", "TOX", "EOMES"),
+  # ==================== NK细胞亚群 ====================
+  "NK cells"               = c("NKG7", "GNLY", "KLRD1", "KLRB1", "NCAM1", "FCGR3A", "GZMB", "KLRF1", "SPON2"),
+  "CD56bright NK"          = c("NCAM1", "XCL1", "XCL2", "GZMK", "IL7R", "CD27", "CD28", "IFNG", "KLRD1"),
+  "CD56dim NK"             = c("FCGR3A", "NKG7", "GNLY", "KLRD1", "KLRF1", "GZMB", "PRF1", "KIR2DL1", "KIR3DL1"))
+
+canonical_markers <- list(
+  # ==================== B细胞亚群 ====================
+  "B cells naive"          = c("CD79A", "CD79B", "MS4A1", "CD19", "IGHD", "IGHM", "TCL1A", "FCER2", "CD24"),
+  "B cells memory"         = c("CD79A", "CD79B", "MS4A1", "CD19", "CD27", "TNFRSF13B", "IGHG1", "AIM2", "CR2"),
+  "Plasma cells"           = c("JCHAIN", "MZB1", "SDC1", "IGHG1", "IGHG2", "XBP1", "PRDM1", "IRF4", "SLAMF7"))
+
+canonical_markers <- list( 
+ # ==================== 单核细胞亚群 ====================
+  "Classical Monocytes"    = c("CD14", "LYZ", "S100A8", "S100A9", "S100A12", "VCAN", "FCN1", "CD36", "CSF1R"),
+  "Non-classical Monocytes"= c("FCGR3A", "MS4A7", "LST1", "LILRB2", "IFITM3", "AIF1", "CDKN1C", "MTSS1", "ITGAX"),
+  "Intermediate Monocytes" = c("CD14", "FCGR3A", "LYZ", "S100A8", "VCAN", "CD36", "ITGAM", "CSF1R", "FCN1"),
+ # ==================== 树突状细胞亚群 ====================
+  "cDC1 (经典1型DC)"       = c("CLEC9A", "XCR1", "CADM1", "ITGAX", "BATF3", "IRF8", "HLA-DRA", "CD86", "THBD"),
+  "cDC2 (经典2型DC)"       = c("CD1C", "FCER1A", "CLEC10A", "ITGAM", "CD1E", "FCER1G", "HLA-DQA1", "CD11c", "IRF4"),
+  "pDC (浆细胞样DC)"       = c("LILRA4", "IRF7", "CLEC4C", "IL3RA", "ITM2C", "PLD4", "GZMB", "TCL1A", "SCT"),
+  # =================== 血小板/巨核细胞 ====================
+  "Platelets"              = c("PPBP", "PF4", "GP9", "ITGA2B", "TUBB1", "TREML1", "CAVIN2", "CMTM5", "ITGB3"),
+   # ==================== 造血干/祖细胞 ====================
+  #"HSPC"                   = c("CD34", "CRHBP", "SPINK2", "HOPX", "AVP", "CYTL1", "MLLT3", "HLF", "PROM1"),
+    # ==================== 粒细胞（PBMC微量） ====================
+  #"Neutrophils"            = c("CSF3R", "CEACAM8", "MPO", "ELANE", "CAMP", "PGLYRP1", "ITGAM", "FCGR3B", "CD10"),
+    # ==================== 红细胞前体 ====================
+  "Erythroid"              = c("HBB", "HBA1", "HBA2", "GYPA", "TFRC", "GATA1", "KLF1", "AHSP", "BPGM")
+) 
+
+canonical_markers <- list(
+  "Total T Cells" = c("CD3D", "CD3E", "CD3G", "CD2", "TRAC", "TRBC1", "CD28"),
+  "T_Naive_Common" = c("CCR7", "SELL", "LEF1", "TCF7", "IL7R", "S1PR1"),
+  "T_Memory_Common" = c("IL7R", "CD27", "CD28", "S100A4", "ITGB1"),
+  "T_Effector_Common" = c("GZMA", "IFNG", "PRF1", "NKG7", "TBX21"),
+  "T_Exhausted_Common" = c("PDCD1", "LAG3", "TIGIT", "CTLA4", "TOX", "EOMES"),
+  "Treg_Specific" = c("FOXP3", "IL2RA", "IKZF2", "BATF"),
+  "CD4+ T Naive"     = c("CD4", "CCR7", "SELL", "LEF1", "TCF7", "IL7R"),
+  "CD4+ T Memory"    = c("CD4", "IL7R", "S100A4", "CD69", "GPR183"),
+  "CD4+ T Effector"  = c("CD4", "GZMA", "IFNG", "TNF", "LAG3"),
+  "CD4+ T Exhausted" = c("CD4", "PDCD1", "LAG3", "TIGIT"),
+  "CD8+ T Naive"     = c("CD8A", "CD8B", "CCR7", "SELL", "LEF1", "TCF7"),
+  "CD8+ T Memory"    = c("CD8A", "CD8B", "IL7R", "GZMK", "S100A4"),
+  "CD8+ T Effector"  = c("CD8A", "CD8B", "GZMB", "PRF1", "NKG7"),
+  "CD8+ T Exhausted" = c("CD8A", "CD8B", "PDCD1", "TOX", "EOMES"),
+  "NK_Common"        = c("NKG7", "GNLY", "KLRD1", "FCGR3A", "GZMB"),
+  "CD56bright NK"    = c("NCAM1", "XCL1", "IL7R", "IFNG"),
+  "CD56dim NK"       = c("FCGR3A", "KIR2DL1", "PRF1", "KLRF1")
 )
- library(Seurat)
+
+library(Seurat)
 library(ggplot2)
 
 # 1. 定义你的原始列表
@@ -1160,6 +1273,7 @@ extended_markers2 <- list(
 
 # 2. 【核心修复】自动去重逻辑
 # 我们遍历列表，记录已经出现过的基因，只保留第一次出现的基因
+extended_markers2=canonical_markers
 seen_genes <- c()
 unique_markers <- lapply(extended_markers2, function(genes) {
   # 只保留对象中存在的基因
@@ -1175,6 +1289,9 @@ unique_markers <- lapply(extended_markers2, function(genes) {
 unique_markers <- unique_markers[sapply(unique_markers, length) > 0]
 
 # 3. 运行 DotPlot
+pdf(file.path(projectPath, "Output", "CellAnnotation",
+                 paste0(date_tag, "_CanonicalMarkers_DotPlot_Tcells_.pdf")),
+  		 width = 26, height = 10)
 p3 <- DotPlot(
   merged_obj,
   features = unique_markers, 
@@ -1220,6 +1337,231 @@ p2 <- DotPlot(merged_obj, features = canonical_markers) +
   labs(title = "Verified Canonical Markers by Cell Type")
 
 print(p2)
+                   
+
+            
+################################################
+# ==============================================
+三步注释逻辑（先圈 T→再分 CD4/CD8→最后细分亚群）
+# ==============================================
+################################################
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(RColorBrewer)
+seurat_obj <- merged_obj 
+Idents(seurat_obj) <- "seurat_clusters"
+DefaultAssay(seurat_obj) <- "RNA"
+# ==============================================
+# 【第一步】区分：T细胞 vs 非T细胞
+# ==============================================
+# 1.1 定义第一步Marker
+step1_markers <- list(
+  "T cells" = c("CD3D", "CD3E", "CD3G", "TRAC", "TRBC1"),
+  "B cells" = c("CD79A", "MS4A1"),
+  "Monocytes" = c("CD14", "LYZ"),
+  "NK cells" = c("NKG7", "GNLY")
+)
+
+# 1.2 可视化验证：DotPlot看Marker表达
+p1 <- DotPlot(seurat_obj, features = step1_markers, cols = "RdYlBu") + 
+  RotatedAxis() + 
+  ggtitle("Step 1: Cluster Markers") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 1.3 筛选出T细胞（根据DotPlot结果，选择CD3高表达的cluster）
+# 假设你看了DotPlot后，确定cluster 0,1,2,3,5是T细胞（替换为你实际的cluster编号）
+T_clusters <- c(0, 2, 5, 6) 
+T_cells <- subset(seurat_obj, idents = T_clusters)
+
+# 1.4 可视化：UMAP展示T细胞圈选结果
+seurat_obj$Step1_Annotation <- ifelse(
+  seurat_obj$seurat_clusters %in% T_clusters,
+  "T cells",
+  "Non-T cells"
+)
+p2 <- DimPlot(seurat_obj, group.by = "Step1_Annotation", reduction = 'umap_harmony', cols = c("#E63946", "#A8DADC"), label = TRUE) +
+  ggtitle("Step 1: T cells vs Non-T cells")
+
+# ==============================================
+# 【第二步】在T细胞内区分：CD4+ T vs CD8+ T
+# ==============================================
+# 2.1 定义第二步Marker
+step2_markers <- list(
+  "CD4+ T cells" = c("CD4", "IL7R"),
+  "CD8+ T cells" = c("CD8A", "CD8B")
+)
+# 2.2 可视化验证：DotPlot
+p3 <- DotPlot(T_cells, features = step2_markers, cols = c("lightgrey", "#457B9D")) +
+  RotatedAxis() + ggtitle("Step 2: CD4+ vs CD8+ T cells")
+# 2.3 精准区分CD4/CD8（基于基因表达互斥）
+gene_expr <- FetchData(T_cells, vars = c("CD4", "CD8A", "CD8B"))
+T_cells$CD4_expr <- gene_expr$CD4
+T_cells$CD8A_expr <- gene_expr$CD8A
+T_cells$CD8B_expr <- gene_expr$CD8B
+T_cells$Step2_Annotation <- case_when(
+  # CD4+ T：CD4表达 > 0 且 CD8A/CD8B 都不表达
+  T_cells$CD4_expr > 0 & T_cells$CD8A_expr == 0 & T_cells$CD8B_expr == 0 ~ "CD4+ T cells", 
+  # CD8+ T：CD8A或CD8B表达 > 0 且 CD4 不表达
+  (T_cells$CD8A_expr > 0 | T_cells$CD8B_expr > 0) & T_cells$CD4_expr == 0 ~ "CD8+ T cells",
+  # 其他情况（双阴/双阳）
+  TRUE ~ "Double negative/positive T cells"
+)
+Idents(T_cells) <- "Step2_Annotation"
+table(T_cells$Step2_Annotation)
+# 2.4 可视化：UMAP展示CD4/CD8分群
+p4 <- DimPlot(T_cells, group.by = "Step2_Annotation", reduction = 'umap_harmony',cols = c("#E63946", "#457B9D", "#999999"), label = TRUE) +
+  ggtitle("Step 2: CD4+ vs CD8+ T cells")
+
+########
+Idents(T_cells) <- "seurat_clusters"
+step02_markers <- list(
+  "Naive T cells" = c("CCR7", "SELL", "TCF7", "LEF1"),
+  "Regulatory T cells" = c("FOXP3", "IL2RA", "CTLA4", "TIGIT"),
+  "Memory T cells" = c("CD27", "CD45RO", "IL7R", "CCR7"),
+  "Effector T cells" = c("GZMA", "GZMB", "PRF1", "IFNG", "TNF", "CD4", "CD8A")
+)
+unique_markers02 <- unique(unlist(step02_markers))
+p44 <- DotPlot(
+  T_cells,
+  features = unique_markers02, 
+  dot.scale = 8
+) + 
+  RotatedAxis() +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  labs(
+    title = "Enhanced Marker Panel (De-duplicated)",
+    x = "Unique Canonical Markers",
+    y = "Cluster Identity"
+  )
+
+# ==============================================
+# 【第三步】在CD4/CD8内细分：功能亚群
+# ==============================================
+# 3.1 定义第三步Marker
+step3_markers <- list(
+  "CD4+ Naive" = c("CCR7", "SELL", "LEF1"),
+  "CD4+ Memory" = c("IL7R", "S100A4", "CD69"),
+  "CD4+ Effector" = c("GZMA", "IFNG", "TNF"),
+  "Treg" = c("FOXP3", "IL2RA", "CTLA4"),
+  "CD8+ Naive" = c("CCR7", "SELL", "LEF1"),
+  "CD8+ Memory" = c("IL7R", "GZMK", "S100A4"),
+  "CD8+ Effector" = c("GZMB", "PRF1", "NKG7"),
+  "CD8+ Exhausted" = c("PDCD1", "LAG3", "TIGIT")
+)
+unique_markers <- unique(unlist(step3_markers))
+Idents(T_cells) <- "seurat_clusters"
+# 3.2 可视化验证：DotPlot看所有亚群Marker
+p5 <- DotPlot(
+  T_cells,
+  features = unique_markers, # 替换为去重后的向量
+  cols = c("lightgrey", "#1D3557")
+) +
+  RotatedAxis() +
+  ggtitle("Step 3: Fine Annotation Markers") +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p5)
+p55 <- DotPlot(
+  T_cells,
+  features = unique_markers, 
+  dot.scale = 8
+) + 
+  RotatedAxis() +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red") +
+  labs(
+    title = "Enhanced Marker Panel (De-duplicated)",
+    x = "Unique Canonical Markers",
+    y = "Cluster Identity"
+  )
+
+
+# 3.3 细分亚群（基于Marker表达，这里以CD4为例，CD8同理）
+# 先把CD4和CD8分开
+CD4_cells <- subset(T_cells, idents = "CD4+ T cells")
+CD8_cells <- subset(T_cells, idents = "CD8+ T cells")
+# 分别定义 CD4 和 CD8 的 Marker（无重复）
+cd4_markers <- list(
+  "CD4+ Naive" = c("CCR7", "SELL", "LEF1"),
+  "CD4+ Memory" = c("IL7R", "S100A4", "CD69"),
+  "CD4+ Effector" = c("GZMA", "IFNG", "TNF"),
+  "Treg" = c("FOXP3", "IL2RA", "CTLA4")
+)
+cd8_markers <- list(
+  "CD8+ Naive" = c("CCR7", "SELL", "LEF1"),
+  "CD8+ Memory" = c("IL7R", "GZMK", "S100A4"),
+  "CD8+ Effector" = c("GZMB", "PRF1", "NKG7"),
+  "CD8+ Exhausted" = c("PDCD1", "LAG3", "TIGIT")
+)
+#画 CD4 的 DotPlot
+Idents(CD4_cells) = 'seurat_clusters'
+p5_cd4 <- DotPlot(
+  T_cells,
+  features = cd4_markers,
+  cols = c("lightgrey", "#E63946")
+) +
+  RotatedAxis() +
+  ggtitle("CD4+ T Cell Subset Markers") +
+  theme(plot.title = element_text(hjust = 0.5))
+# 画 CD8 的 DotPlot
+Idents(CD8_cells) = 'seurat_clusters'
+p5_cd8 <- DotPlot(
+  T_cells,
+  features = cd8_markers,
+  cols = c("lightgrey", "#457B9D")
+) +
+  RotatedAxis() +
+  ggtitle("CD8+ T Cell Subset Markers") +
+  theme(plot.title = element_text(hjust = 0.5))
+# 拼图展示（论文级）
+library(patchwork)
+#p5_cd4_cd8 = p5_cd4 + p5_cd8
+
+# ==============================================
+# 最终汇总与导出
+# ==============================================
+# 建议：最终的 Fine_Annotation 应该基于 Step2 + seurat_clusters 的综合判断
+T_cells$Fine_Annotation <- paste0(T_cells$Step2_Annotation, "_Cluster_", T_cells$seurat_clusters)
+# 拼图展示
+#final_plot <- (p1 | p2) / (p4) / (p5_cd4 | p5_cd8) + 
+#               plot_layout(heights = c(1, 0.8, 1.2))
+#print(final_plot)# 查看最终注释统计
+table(T_cells$Fine_Annotation)
+# 3. 运行 DotPlot
+pdf(file.path(projectPath, "Output", "CellAnnotation",
+                 paste0(date_tag, "_CanonicalMarkers_DotPlot_Tcells_DotplotDimplotDetailed.pdf")),
+  		 width = 26, height = 10)
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+print(p44)
+print(p5)
+print(p55)
+print(p5_cd4)
+print(p5_cd8)
+#print(p5_cd4_cd8)
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
                                
 
 # ================================================================  
