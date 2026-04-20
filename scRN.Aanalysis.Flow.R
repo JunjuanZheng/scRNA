@@ -1552,7 +1552,31 @@ dev.off()
 
 
 
-
+# 3.2 特征表达图 (FeaturePlot) - 查看核心 Marker 在 UMAP 上的分布
+DotPlot(
+  monocyte_obj,
+  features = markers_to_check,
+  group.by = "RNA_snn_res.0.05",
+  dot.scale = 10,          # 控制点的大小范围
+  scale = TRUE,            # 标准化表达量，使颜色对比更明显
+  cols = c("lightgrey", "blue"), # 颜色梯度：浅灰（低表达）→ 蓝色（高表达）
+  col.min = -1,            # 颜色梯度最小值
+  col.max = 1              # 颜色梯度最大值
+) +
+  scale_y_discrete(labels = c("Classical Monocyte" = "0", "Non-classical Monocyte" = "1")) + # 对应你的y轴0/1
+  theme_bw() +
+  labs(
+    x = "Features",
+    y = "Identity",
+    fill = "Average Expression",
+    size = "Percent Expressed"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 12)
+  )
 
 
 
