@@ -1584,9 +1584,13 @@ DotPlot(
 
 
 
+load('/mnt2/wanggd_group/zjj/Part/DiabeticNeuralgia/scRNA_PBMC_DPN/Data/08_260417_6Samples_Harmony_Clustered_Annotated.Rdata')
+merged_obj
+# 查看对象
+merged_obj
+table(merged_obj$seurat_clusters)
 
 
-                               
 
 # ================================================================  
 # 11. 手动注释模板（根据 SingleR + Marker 结果调整）  
@@ -1599,26 +1603,66 @@ message("========================================")
 # ★★★ 查看 SingleR 注释 + marker 后，在此处手动修改 ★★★  
 # 示例模板（运行后根据实际结果调整）：  
 #  
-# manual_labels <- c(  
-#   "0"  = "CD4+ T cells",  
-#   "1"  = "Monocytes",  
-#   "2"  = "CD8+ T cells",  
-#   "3"  = "B cells",  
-#   "4"  = "NK cells",  
-#   "5"  = "Fibroblasts",  
-#   "6"  = "cDC",  
-#   "7"  = "Plasma cells",  
-#   "8"  = "Endothelial",  
-#   "9"  = "pDC"  
-#   # ... 根据实际 cluster 数量继续添加  
-# )  
-#  
-# merged_obj$cell_type_manual <- manual_labels[as.character(merged_obj$seurat_clusters)]  
-#  
-# p_manual <- DimPlot(merged_obj, reduction = "umap_harmony",  
-#                      group.by = "cell_type_manual",  
-#                      label
+merged_obj <- RenameIdents(merged_obj,
+  "0"  = "CD4+ naive T",
+  "1"  = "NK cells",
+  "2"  = "CD8+ effector T",
+  "3"  = "Classical monocytes",
+  "4"  = "NK cells",
+  "5"  = "CD8+ naive T",
+  "6"  = "CD4+ memory T",
+  "7"  = "Plasma cells",
+  "8"  = "Non-classical monocytes",
+  "9"  = "B cells",
+  "10" = "DC cells",
+  "11" = "Megakaryocytes"
+)
 
+# 应用注释
+merged_obj$cell_type_manual <- manual_labels[as.character(merged_obj$seurat_clusters)]
+
+# 查看注释结果
+table(merged_obj$cell_type_manual)
+
+# ================================================================
+# 绘制 UMAP 图（手动注释）
+# ================================================================
+p_manual <- DimPlot(
+  merged_obj,
+  reduction = "umap_harmony",
+  group.by = "cell_type_manual",
+  label = TRUE,        # 补上了！
+  label.size = 4,
+  repel = TRUE,
+  pt.size = 0.1
+) +
+  ggtitle("Cell Types (Manual Annotation)") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p_manual)
+                              
+p_manual <- DimPlot(merged_obj,
+                    reduction = "umap_harmony",
+                    group.by = "cell_type_manual",
+                    label = TRUE,
+                    repel = TRUE,
+                    label.size = 4,
+                    pt.size = 0.1)
+
+print(p_manual)
+ggsave(file.path(projectPath, "Output", "CellAnnotation",
+                 paste0(date_tag, "Harmony_Clustered_Annotated_CellTypeManual.pdf")),
+       plot = p_manual, width = 10, height = 10, dpi = 300)
+
+save_file_annotated <- file.path(projectPath, "Data",
+                                  make_filename(
+                                    length(unique(merged_obj$orig.ident)),
+                                    "Harmony_Clustered_Annotated_CellTypeManual",
+                                    prefix = "08_"))
+save(merged_obj, file = save_file_annotated)
+message("✅ 已保存最终注释对象：", save_file_annotated)
+                               
+                               
 # 流程完成提示
 message("\n========================================")
 message("★ Full Single-cell RNA-seq Pipeline Finished!")
