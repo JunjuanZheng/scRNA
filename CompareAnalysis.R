@@ -28,6 +28,12 @@ set.seed(42)
 # ★ 日期标签 ★
 date_tag <- format(Sys.Date(), "%y%m%d")
 
+# 动态文件名生成函数
+make_filename <- function(n_samples, suffix, prefix = "", ext = "Rdata") {
+  fname <- paste0(prefix, date_tag, "_", n_samples, "Samples_", suffix, ".", ext)
+  return(fname)
+}
+
 # 并行设置
 plan("multicore", workers = 6)
 options(future.globals.maxSize = 80 * 1024^3)
@@ -54,7 +60,7 @@ dir.create(file.path(projectPath, "Output", "DPN_Analysis", "11_Summary"),      
 message("\n===== Step 1: Data Preparation =====")
 
 load(file.path(projectPath, "Data",
-               "08_260409_6Samples_Harmony_Clustered_Annotated.Rdata"))
+               "08_260513_6Samples_Harmony_Clustered_Annotated_CellTypeManual.Rdata"))
 
 # ---- 1.1 添加分组标签 ----
 group_map <- c(
@@ -69,8 +75,8 @@ merged_obj@meta.data$group <- group_map[merged_obj$orig.ident]
 merged_obj$group <- factor(merged_obj$group, levels = c("Control", "DPN"))
 
 # ---- 1.2 设置主要 Ident 为手动注释的细胞类型 ----
-Idents(merged_obj) <- 'seurat_clusters'
-merged_obj$cell_type_manual <- Idents(merged_obj)
+Idents(merged_obj) <- 'cell_type_manual'
+table(merged_obj$cell_type_manual)
 
 # 定义配色
 group_colors     <- c("Control" = "#4878D0", "DPN" = "#EE854A")
@@ -208,15 +214,6 @@ filter_ensg <- function(genes) {
 
 
 # ================================================================
-# 全局工具函数：过滤 ENSG 基因（在所有步骤之前定义）
-# ================================================================
-
-# ★ 过滤 ENSG 开头的基因的通用函数
-filter_ensg <- function(genes) {
-  genes[!grepl("^ENSG", genes)]
-}
-
-# ================================================================
 # 步骤 3：分细胞类型差异表达分析（Pseudo-bulk）
 # ================================================================
 message("\n===== Step 3: Cell-type Specific DEG Analysis =====")
@@ -351,6 +348,112 @@ for (ct in cell_types) {
                    paste0(date_tag, "_Volcano_", gsub("[/ +]", "_", ct), ".png")),
          plot = p_vol, width = 8, height = 6, dpi = 300)
 }
+
+# ================================================================
+# 步骤 3：分细胞类型差异表达分析 (Single-cell Level - FindMarkers)
+# ================================================================
+message("\n===== Step 3: Cell-type Specific DEG Analysis (FindMarkers) =====")
+
+# ---- 3.0 准备工作：构建联合分组列 ----
+# 格式如：DPN_Classical Monocytes, Control_Classical Monocytes
+merged_obj$Group_CellTypeMannual <- paste0(merged_obj$group, "_", merged_obj$cell_type_manual)
+table(merged_obj$Group_CellTypeMannual)
+
+# 设置当前的 Ident 为新构建的联合分组列
+Idents(merged_obj) <- "Group_CellTypeMannual"
+
+cell_types <- levels(as.factor(merged_obj$cell_type_manual))
+all_deg_results <- list()
+
+# 确保输出目录存在
+deg_out_dir <- file.path(projectPath, "Output", "DPN_Analysis", "03_DEG")
+if(!dir.exists(deg_out_dir)) dir.create(deg_out_dir, recursive = TRUE)
+
+groups = levels(as.factor(merged_obj$group))
+groups
+caseGroup = groups[2]
+controlGroup = groups[1]
+
+for (ct in cell_types) {
+  ident_case <- paste0(caseGroup, "_", ct)
+  ident_ctrl <- paste0(controlGroup, "_", ct)
+  message(sprintf("  Processing: %s", ct))
+  # 检查两个分组是否存在且细胞数是否达标（阈值设为 10，可根据实际情况调整）
+  n_dpn <- sum(merged_obj$Group_CellTypeMannual == ident_case)
+  n_ctrl <- sum(merged_obj$Group_CellTypeMannual == ident_ctrl)
+  if (n_dpn < 10 | n_ctrl < 10) {
+    message(sprintf("    Skipped %s: Too few cells (DPN=%d, Control=%d)", ct, n_dpn, n_ctrl))
+    next
+  }
+  # ---- 3.1 运行 FindMarkers (Wilcoxon 秩和检验) ----
+  # 使用 logfc.threshold = 0 表示保留所有基因，方便后续画完整的火山图
+  res <- FindMarkers(merged_obj, 
+                     ident.1 = ident_case, 
+                     ident.2 = ident_ctrl,
+                     logfc.threshold = 0,
+                     min.pct = 0.1,  # 在至少 10% 的细胞中表达
+                     only.pos = FALSE)
+  # ---- 3.2 结果处理与过滤 ----
+  res_df <- res %>%
+    rownames_to_column("gene") %>%
+    # 过滤 ENSG 开头的非命名基因（适配犬类基因组中未定义的区域）
+    filter(!grepl("^ENSG", gene)) %>%
+    mutate(
+      cell_type = ct,
+      # 判定上调/下调：设定 p_val_adj < 0.05 且 |log2FC| > 0.25
+      direction = case_when(
+        p_val_adj < 0.05 & avg_log2FC > 0.25 ~ "Up in DPN",
+        p_val_adj < 0.05 & avg_log2FC < -0.25 ~ "Down in DPN",
+        TRUE ~ "NS"
+      )
+    ) %>%
+    arrange(p_val_adj, desc(abs(avg_log2FC)))
+
+  all_deg_results[[ct]] <- res_df
+  # 保存 CSV
+  file_name_ct <- gsub("[/ +]", "_", ct)
+  write.csv(res_df, 
+            file.path(deg_out_dir, paste0(date_tag, "_DEG_", file_name_ct, ".csv")), 
+            row.names = FALSE)
+  # ---- 3.3 火山图绘制 ----
+  n_up <- sum(res_df$direction == "Up in DPN")
+  n_down <- sum(res_df$direction == "Down in DPN")
+  # 选取 top 20 差异基因进行标注
+  top_genes <- res_df %>%
+    filter(direction != "NS") %>%
+    slice_max(abs(avg_log2FC), n = 20) %>%
+    pull(gene)
+  p_vol <- ggplot(res_df, aes(x = avg_log2FC, y = -log10(p_val_adj), color = direction)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c("Up in DPN" = "#E64B35", 
+                                  "Down in DPN" = "#4DBBD5", 
+                                  "NS" = "grey80")) +
+    # 辅助线
+    geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    # 基因标注
+    ggrepel::geom_text_repel(data = subset(res_df, gene %in% top_genes),
+                             aes(label = gene), size = 3, 
+                             max.overlaps = 50, fontface = "italic") +
+    theme_minimal() +
+    labs(title = paste0("Volcano Plot: ", ct),
+         subtitle = paste0("Up: ", n_up, " | Down: ", n_down),
+         x = "log2 Fold Change (DPN vs Control)",
+         y = "-log10(Adjusted P-value)") +
+    theme(legend.position = "right",
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+  # 保存图片
+  ggsave(file.path(deg_out_dir, paste0(date_tag, "_Volcano_", file_name_ct, ".png")),
+         plot = p_vol, width = 7, height = 6, dpi = 300)
+  
+  message(sprintf("    DEGs identified: Up=%d, Down=%d", n_up, n_down))
+}
+
+# 汇总所有结果到一个大表
+all_deg_df <- bind_rows(all_deg_results)
+write.csv(all_deg_df, file.path(deg_out_dir, paste0(date_tag, "_All_CellType_DEGs_Combined.csv")), row.names = FALSE)
+
+
 
 
 # ================================================================
