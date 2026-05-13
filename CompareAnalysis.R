@@ -353,6 +353,9 @@ for (ct in cell_types) {
 # 步骤 3：分细胞类型差异表达分析 (Single-cell Level - FindMarkers)
 # ================================================================
 message("\n===== Step 3: Cell-type Specific DEG Analysis (FindMarkers) =====")
+library(ggplot2)
+library(dplyr)
+library(tidyr)
 
 # ---- 3.0 准备工作：构建联合分组列 ----
 # 格式如：DPN_Classical Monocytes, Control_Classical Monocytes
@@ -374,82 +377,129 @@ groups
 caseGroup = groups[2]
 controlGroup = groups[1]
 
+# 初始化一个用于存放汇总数量的列表
+deg_count_summary <- list()
+
 for (ct in cell_types) {
   ident_case <- paste0(caseGroup, "_", ct)
   ident_ctrl <- paste0(controlGroup, "_", ct)
-  message(sprintf("  Processing: %s", ct))
-  # 检查两个分组是否存在且细胞数是否达标（阈值设为 10，可根据实际情况调整）
+  
+  message(sprintf(">>> Analyzing Cell Type: %s", ct))
+  
+  # 3.1. 细胞数检查
   n_dpn <- sum(merged_obj$Group_CellTypeMannual == ident_case)
   n_ctrl <- sum(merged_obj$Group_CellTypeMannual == ident_ctrl)
+  
   if (n_dpn < 10 | n_ctrl < 10) {
-    message(sprintf("    Skipped %s: Too few cells (DPN=%d, Control=%d)", ct, n_dpn, n_ctrl))
+    message(sprintf("    [Skipped] %s: Cells too few (DPN=%d, Control=%d)", ct, n_dpn, n_ctrl))
     next
   }
-  # ---- 3.1 运行 FindMarkers (Wilcoxon 秩和检验) ----
-  # 使用 logfc.threshold = 0 表示保留所有基因，方便后续画完整的火山图
+  # 3.2. 差异分析
   res <- FindMarkers(merged_obj, 
                      ident.1 = ident_case, 
                      ident.2 = ident_ctrl,
                      logfc.threshold = 0,
-                     min.pct = 0.1,  # 在至少 10% 的细胞中表达
+                     min.pct = 0.1, 
                      only.pos = FALSE)
-  # ---- 3.2 结果处理与过滤 ----
+  # 3.3. 结果过滤与清洗
   res_df <- res %>%
     rownames_to_column("gene") %>%
-    # 过滤 ENSG 开头的非命名基因（适配犬类基因组中未定义的区域）
-    filter(!grepl("^ENSG", gene)) %>%
+    filter(!grepl("^ENSG", gene)) %>% # 过滤犬类非命名基因
     mutate(
       cell_type = ct,
-      # 判定上调/下调：设定 p_val_adj < 0.05 且 |log2FC| > 0.25
       direction = case_when(
         p_val_adj < 0.05 & avg_log2FC > 0.25 ~ "Up in DPN",
         p_val_adj < 0.05 & avg_log2FC < -0.25 ~ "Down in DPN",
         TRUE ~ "NS"
       )
-    ) %>%
-    arrange(p_val_adj, desc(abs(avg_log2FC)))
-
-  all_deg_results[[ct]] <- res_df
-  # 保存 CSV
-  file_name_ct <- gsub("[/ +]", "_", ct)
-  write.csv(res_df, 
-            file.path(deg_out_dir, paste0(date_tag, "_DEG_", file_name_ct, ".csv")), 
-            row.names = FALSE)
-  # ---- 3.3 火山图绘制 ----
+    )
+  
+  # 3.4. 统计数量供后续画柱状图
   n_up <- sum(res_df$direction == "Up in DPN")
   n_down <- sum(res_df$direction == "Down in DPN")
-  # 选取 top 20 差异基因进行标注
-  top_genes <- res_df %>%
-    filter(direction != "NS") %>%
-    slice_max(abs(avg_log2FC), n = 20) %>%
-    pull(gene)
+  deg_count_summary[[ct]] <- data.frame(CellType = ct, Up = n_up, Down = n_down)
+  
+  # 3.5. 绘制火山图
+  file_name_ct <- gsub("[/ +]", "_", ct)
+  top_genes <- res_df %>% filter(direction != "NS") %>% slice_max(abs(avg_log2FC), n = 20)
+  
   p_vol <- ggplot(res_df, aes(x = avg_log2FC, y = -log10(p_val_adj), color = direction)) +
     geom_point(alpha = 0.4, size = 0.8) +
-    scale_color_manual(values = c("Up in DPN" = "#E64B35", 
-                                  "Down in DPN" = "#4DBBD5", 
-                                  "NS" = "grey80")) +
-    # 辅助线
-    geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey40") +
-    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
-    # 基因标注
-    ggrepel::geom_text_repel(data = subset(res_df, gene %in% top_genes),
-                             aes(label = gene), size = 3, 
-                             max.overlaps = 50, fontface = "italic") +
+    scale_color_manual(values = c("Up in DPN" = "#E64B35", "Down in DPN" = "#4DBBD5", "NS" = "grey80")) +
+    geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    ggrepel::geom_text_repel(data = top_genes, aes(label = gene), size = 3, fontface = "italic") +
     theme_minimal() +
-    labs(title = paste0("Volcano Plot: ", ct),
-         subtitle = paste0("Up: ", n_up, " | Down: ", n_down),
-         x = "log2 Fold Change (DPN vs Control)",
-         y = "-log10(Adjusted P-value)") +
-    theme(legend.position = "right",
-          plot.title = element_text(hjust = 0.5, face = "bold"))
-  # 保存图片
-  ggsave(file.path(deg_out_dir, paste0(date_tag, "_Volcano_", file_name_ct, ".png")),
-         plot = p_vol, width = 7, height = 6, dpi = 300)
+    labs(title = paste0("Volcano: ", ct), subtitle = sprintf("Up=%d, Down=%d", n_up, n_down))
+
+  # 强制保存并打印状态
+  vol_path <- file.path(deg_out_dir, paste0(date_tag, "_Volcano_", file_name_ct, ".png"))
+  ggsave(vol_path, plot = p_vol, width = 7, height = 6, dpi = 300)
   
-  message(sprintf("    DEGs identified: Up=%d, Down=%d", n_up, n_down))
+  if(file.exists(vol_path)) message(sprintf("    [Success] Volcano saved to %s", vol_path))
+  
+  write.csv(res_df, file.path(deg_out_dir, paste0(date_tag, "_DEG_", file_name_ct, ".csv")), row.names = FALSE)
 }
 
+# 3.6. 生成差异基因数量汇总柱状图 (Bar Plot)
+message("\n===== Generating High-Quality Summary Bar Plot =====")
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats) # 用于处理因子排序
+# 整理数据并计算总数用于排序
+summary_df <- do.call(rbind, deg_count_summary) %>%
+  mutate(Total = Up + Down) %>%
+  # 按照总数排序，如果总数一样，则按 Up 排序
+  arrange(desc(Total), desc(Up))
+# 转换为长格式并处理绘图逻辑
+plot_data <- summary_df %>%
+  pivot_longer(cols = c("Up", "Down"), names_to = "Direction", values_to = "Count") %>%
+  mutate(
+    # 为了镜像效果，将 Down 设置为负值
+    PlotCount = ifelse(Direction == "Down", -Count, Count),
+    # 强制固定 CellType 的顺序（由 Total 决定）
+    CellType = fct_reorder(CellType, Total)
+  )
+#  绘图
+p_bar_polished <- ggplot(plot_data, aes(x = CellType, y = PlotCount, fill = Direction)) +
+  # 绘制柱子，设置边框色为白色可以让柱子更有质感
+  geom_bar(stat = "identity", width = 0.75, color = "white", size = 0.2) +
+  # 添加基准线
+  geom_hline(yintercept = 0, color = "black", size = 0.5) +
+  # 核心：添加数值标签
+  # 使用 ifelse 处理标签位置，避免 0 被标出来
+  geom_text(aes(label = ifelse(Count > 0, Count, ""), 
+                y = PlotCount, 
+                hjust = ifelse(Direction == "Up", -0.2, 1.2)), 
+            size = 3.5, fontface = "bold") +
+  # 配色方案 (选用更具学术感的红蓝)
+  scale_fill_manual(values = c("Up" = "#DC0000FF", "Down" = "#3C5488FF"),
+                    labels = c("Down" = "Down-regulated", "Up" = "Up-regulated")) +
+  # 坐标轴处理：去除负号，并留出足够的空间给标签
+  scale_y_continuous(labels = abs, 
+                     expand = expansion(mult = c(0.15, 0.15))) + 
+  coord_flip() + # 横向排列
+  theme_classic() + # 经典学术主题
+  labs(title = "Differential Gene Statistics",
+       subtitle = "DPN vs Control Group",
+       x = NULL, 
+       y = "Number of Differentially Expressed Genes",
+       fill = "Regulation") +
+  theme(
+    axis.text = element_text(color = "black", size = 10),
+    axis.text.y = element_text(face = "bold.italic"), # 细胞类型通常用斜体
+    axis.line.y = element_blank(), # 去除纵轴线，通过中间的 hline 区分
+    axis.ticks.y = element_blank(),
+    legend.position = "top", # 图例放上方更符合你给出的参考图
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30")
+  )
+final_bar_path <- file.path(deg_out_dir, paste0(date_tag, "_DEG_Summary_BarPlot.png"))
+ggsave(final_bar_path, plot = p_bar_polished, width = 9, height = 7, dpi = 300)
+message(sprintf(">>> Professional BarPlot saved to: %s", final_bar_path))
 # 汇总所有结果到一个大表
+head(all_deg_results)
 all_deg_df <- bind_rows(all_deg_results)
 write.csv(all_deg_df, file.path(deg_out_dir, paste0(date_tag, "_All_CellType_DEGs_Combined.csv")), row.names = FALSE)
 
