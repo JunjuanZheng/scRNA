@@ -728,6 +728,68 @@ if (length(upset_list) >= 3) {
 } else {
   # ... 原有的警告信息 ...
 }
+##########
+#提取所有细胞类型共同上调的“核心基因”
+##########
+# 假设你的 upset_list 包含 5 个细胞类型
+# 提取所有细胞类型的交集
+core_up_genes <- Reduce(intersect, upset_list)
+message(sprintf("检测到 %d 个在所有细胞类型中共同上调的核心基因", length(core_up_genes)))
+print(core_up_genes)
+# 保存到本地
+write.table(core_up_genes, 
+            file = file.path(projectPath, "Output", "DPN_Analysis", "04_KeyGenes", "Core_Up_Regulated_Genes.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+#############
+#生成“基因-细胞类型”对应矩阵（最推荐，最全面）
+#############
+library(tidyverse)
+# 将列表转换为长格式数据框
+gene_intersection_df <- stack(upset_list) %>%
+  rename(gene = values, cell_type = ind) %>%
+  group_by(gene) %>%
+  # 将该基因出现的细胞类型合并到一列，用分号隔开
+  summarise(
+    occurrence_count = n(),
+    present_in = paste(sort(cell_type), collapse = "; ")
+  ) %>%
+  arrange(desc(occurrence_count))
+
+# 保存这个全表，这对应了 UpSet 图里所有的柱子信息
+write.csv(gene_intersection_df, 
+          file = file.path(projectPath, "Output", "DPN_Analysis", "04_KeyGenes", "UpSet_Gene_Intersections_Detail.csv"),
+          row.names = FALSE)
+
+# 看看那些在 3 个及以上亚群中都上调的基因
+high_sharing_genes <- gene_intersection_df %>% filter(occurrence_count >= 3)
+
+#############
+#提取特定亚群之间特有的交集
+#############
+# 定义你感兴趣的组合
+target_cts <- c("Classical_Monocytes", "Non_classical_Monocytes")
+# 找出这些亚群的并集
+all_cts <- names(upset_list)
+other_cts <- setdiff(all_cts, target_cts)
+
+# 逻辑：在目标亚群的交集里，且不在其他亚群的并集里
+specific_shared_genes <- intersect(upset_list[[target_cts[1]]], upset_list[[target_cts[2]]]) %>%
+  setdiff(unlist(upset_list[other_cts]))
+
+message(sprintf("仅在单核细胞亚群间共享的基因数: %d", length(specific_shared_genes)))
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ---- 4.4 VlnPlot ----
 key_genes_show <- head(top_up[!grepl("^ENSG", top_up)], 9)
