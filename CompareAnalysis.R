@@ -499,9 +499,9 @@ final_bar_path <- file.path(deg_out_dir, paste0(date_tag, "_DEG_Summary_BarPlot.
 ggsave(final_bar_path, plot = p_bar_polished, width = 9, height = 7, dpi = 300)
 message(sprintf(">>> Professional BarPlot saved to: %s", final_bar_path))
 # 汇总所有结果到一个大表
-head(all_deg_results)
-all_deg_df <- bind_rows(all_deg_results)
-write.csv(all_deg_df, file.path(deg_out_dir, paste0(date_tag, "_All_CellType_DEGs_Combined.csv")), row.names = FALSE)
+#head(all_deg_results)
+#all_deg_df <- bind_rows(all_deg_results)
+#write.csv(all_deg_df, file.path(deg_out_dir, paste0(date_tag, "_All_CellType_DEGs_Combined.csv")), row.names = FALSE)
 
 
 
@@ -569,35 +569,46 @@ ggsave(file.path(projectPath, "Output", "DPN_Analysis", "03_DEG",
        plot = p_deg_bar, width = 10, height = 7, dpi = 300)
 
 # ---- 4.1 Multi-celltype shared DEGs ----
+# 过滤显著差异基因（与原代码一致，确保all_deg_df列名与sig_deg相同）
 sig_deg <- all_deg_df %>% filter(direction != "NS")
 
+# ==============================================
+# 跨细胞类型上调基因统计（DPN中高表达）
+# ==============================================
 up_genes_per_ct <- sig_deg %>%
-  filter(direction == "Up in DPN",
-         !grepl("^ENSG", gene)) %>%
+  filter(
+    direction == "Up in DPN",
+    !grepl("^ENSG", gene)  # 过滤ENSG编号基因
+  ) %>%
   group_by(gene) %>%
   summarise(
-    n_celltypes = n_distinct(cell_type),
-    cell_types  = paste(cell_type, collapse = "; "),
-    mean_log2FC = mean(log2FoldChange),
-    min_padj    = min(padj),
+    n_celltypes = n_distinct(cell_type),  # 该基因在多少种细胞类型中上调
+    cell_types  = paste(cell_type, collapse = "; "),  # 列出所有细胞类型
+    mean_log2FC = mean(avg_log2FC),  # 平均log2倍数变化
+    min_padj    = min(p_val_adj),  # 最小校正p值
     .groups = "drop"
   ) %>%
-  filter(n_celltypes >= 2) %>%
-  arrange(desc(n_celltypes), desc(mean_log2FC))
+  filter(n_celltypes >= 2) %>%  # 只保留在至少2种细胞类型中上调的基因
+  arrange(desc(n_celltypes), desc(mean_log2FC))  # 按细胞类型数和倍数变化排序
 
+# ==============================================
+# 跨细胞类型下调基因统计（DPN中低表达）
+# ==============================================
 dn_genes_per_ct <- sig_deg %>%
-  filter(direction == "Down in DPN",
-         !grepl("^ENSG", gene)) %>%
+  filter(
+    direction == "Down in DPN",
+    !grepl("^ENSG", gene)
+  ) %>%
   group_by(gene) %>%
   summarise(
     n_celltypes = n_distinct(cell_type),
     cell_types  = paste(cell_type, collapse = "; "),
-    mean_log2FC = mean(log2FoldChange),
-    min_padj    = min(padj),
+    mean_log2FC = mean(avg_log2FC),
+    min_padj    = min(p_val_adj),
     .groups = "drop"
   ) %>%
   filter(n_celltypes >= 2) %>%
-  arrange(desc(n_celltypes), desc(abs(mean_log2FC)))
+  arrange(desc(n_celltypes), desc(abs(mean_log2FC)))  # 下调基因按绝对值排序
 
 message(sprintf("  Multi-celltype UP   genes (>=2 types): %d",
                 nrow(up_genes_per_ct)))
@@ -619,58 +630,103 @@ top_down      <- head(dn_genes_per_ct$gene, 20)
 top_genes_all <- c(top_up, top_down)
 
 if (length(top_genes_all) > 0) {
+  # 构建差异表达矩阵（仅保留显著差异基因）
   deg_matrix <- all_deg_df %>%
-    filter(gene %in% top_genes_all) %>%
-    select(gene, cell_type, log2FoldChange) %>%
-    pivot_wider(names_from  = cell_type,
-                values_from = log2FoldChange,
-                values_fill = 0) %>%
+    filter(
+      gene %in% top_genes_all,
+      direction != "NS"  # 双重保险：只保留显著差异基因
+    ) %>%
+    select(gene, cell_type, avg_log2FC) %>%  # ★ 核心修改：log2FoldChange → avg_log2FC
+    pivot_wider(
+      names_from  = cell_type,
+      values_from = avg_log2FC,  # ★ 核心修改
+      values_fill = 0  # 无差异的细胞类型填充为0
+    ) %>%
     column_to_rownames("gene")
 
-  pheatmap(deg_matrix,
-           color         = colorRampPalette(c("#4DBBD5", "white", "#E64B35"))(100),
-           breaks        = seq(-3, 3, length.out = 101),
-           cluster_rows  = TRUE,
-           cluster_cols  = TRUE,
-           show_rownames = TRUE,
-           fontsize_row  = 8,
-           main          = "Top DEGs Across Cell Types (DPN vs Control)",
-           filename      = file.path(projectPath, "Output", "DPN_Analysis",
-                                      "04_KeyGenes",
-                                      paste0(date_tag, "_KeyGenes_Heatmap.png")),
-           width = 14, height = 12)
-  message("  Heatmap saved.")
+  # 数据验证：确保矩阵非空
+  if (nrow(deg_matrix) == 0 || ncol(deg_matrix) == 0) {
+    message("  Warning: No valid DEGs for heatmap, skipping.")
+  } else {
+    # ★ 新增：数值截断（将超出±3的数值限制在范围内，避免极端值拉偏颜色）
+    deg_matrix[deg_matrix > 3] <- 3
+    deg_matrix[deg_matrix < -3] <- -3
+
+    # 绘制热图
+    pheatmap(
+      deg_matrix,
+      color         = colorRampPalette(c("#4DBBD5", "white", "#E64B35"))(100),
+      breaks        = seq(-3, 3, length.out = 101),
+      cluster_rows  = TRUE,
+      cluster_cols  = TRUE,
+      show_rownames = TRUE,
+      fontsize_row  = 8,
+      fontsize_col  = 10,
+      border_color  = NA,  # 去掉单元格边框，更美观
+      main          = "Top DEGs Across Cell Types (DPN vs Control)",
+      filename      = file.path(projectPath, "Output", "DPN_Analysis",
+                                 "04_KeyGenes",
+                                 paste0(date_tag, "_KeyGenes_Heatmap.png")),
+      width         = 14,
+      height        = 12
+    )
+    message("  Heatmap saved successfully.")
+  }
 } else {
   message("  Warning: No cross-celltype DEGs found, skipping Heatmap.")
 }
-
+  
 # ---- 4.3 UpSet Plot ----
-library(UpSetR)
-
-upset_list <- lapply(names(all_deg_results), function(ct) {
-  sig_deg %>%
-    filter(cell_type == ct,
-           direction == "Up in DPN",
-           !grepl("^ENSG", gene)) %>%
-    pull(gene)
-})
-names(upset_list) <- names(all_deg_results)
-upset_list <- upset_list[sapply(upset_list, length) > 5]
-
+# ==============================================
+# 绘制UpSet图（优化版）
+# ==============================================
 if (length(upset_list) >= 3) {
-  png(file.path(projectPath, "Output", "DPN_Analysis", "04_KeyGenes",
-                paste0(date_tag, "_KeyGenes_UpSet.png")),
-      width = 1800, height = 1200, res = 150)
-  upset(fromList(upset_list),
-        nsets          = length(upset_list),
-        order.by       = "freq",
-        text.scale     = 1.2,
-        main.bar.color = "#E64B35",
-        sets.bar.color = "#4DBBD5")
+  
+  # 关键修正 1：清洗列表名称，防止特殊字符干扰 UpSetR 的列名转换
+  # UpSetR 会把名称转为数据框列名，特殊字符会导致匹配失败
+  names(upset_list) <- gsub("[/ +\\-]", "_", names(upset_list))
+  
+  # 调试：检查转换后的矩阵是否为空
+  test_df <- fromList(upset_list)
+  if (nrow(test_df) == 0 || ncol(test_df) == 0) {
+    stop("错误：fromList 转换后的数据框为空，请检查输入基因集是否存在交集。")
+  }
+
+  png(
+    file.path(projectPath, "Output", "DPN_Analysis", "04_KeyGenes",
+              paste0(date_tag, "_KeyGenes_UpSet.png")),
+    width = 1800, 
+    height = 1200, 
+    res = 150
+  )
+  
+  # 关键修正 2：使用 print() 包裹 upset() 函数
+  # 确保绘图对象被正确发送到 png 设备
+  p <- upset(
+    test_df, # 使用预处理好的数据框
+    nsets = length(upset_list),
+    nintersects = 40,
+    order.by = "freq",
+    decreasing = TRUE,
+    show.numbers = "yes",
+    number.angles = 0,
+    point.size = 3,
+    line.size = 1,
+    text.scale = c(1.5, 1.2, 1.2, 1, 1.5, 1),
+    mainbar.y.label = "Intersection Size",
+    sets.x.label = "Genes per Cell Type",
+    main.bar.color = "#E64B35",
+    sets.bar.color = "#4DBBD5",
+    matrix.color = "#E64B35",
+    shade.color = "lightgray"
+  )
+  
+  print(p) # 显式打印
+  
   dev.off()
-  message("  UpSet plot saved.")
+  message("✅ UpSet plot saved successfully.")
 } else {
-  message("  Warning: fewer than 3 valid cell types, skipping UpSet plot.")
+  # ... 原有的警告信息 ...
 }
 
 # ---- 4.4 VlnPlot ----
