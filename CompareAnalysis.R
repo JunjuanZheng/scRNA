@@ -503,6 +503,14 @@ message(sprintf(">>> Professional BarPlot saved to: %s", final_bar_path))
 #all_deg_df <- bind_rows(all_deg_results)
 #write.csv(all_deg_df, file.path(deg_out_dir, paste0(date_tag, "_All_CellType_DEGs_Combined.csv")), row.names = FALSE)
 
+# 设置保存路径
+save_path <- file.path(projectPath, "Output", "DPN_Analysis", "03_DEG", 
+                       paste0(date_tag, "_all_deg_results_list.rds"))
+
+# 存储变量
+saveRDS(all_deg_results, file = save_path)
+
+message(sprintf("✅ 变量已成功存储至: %s", save_path))
 
 
 
@@ -818,6 +826,11 @@ if (length(key_genes_show) > 0) {
 message("\n  Step 4 complete!")
 
 
+
+
+
+load('/mnt2/wanggd_group/zjj/Part/DiabeticNeuralgia/scRNA_PBMC_DPN/Output/DPN_Analysis/03_DEG/260513_all_deg_results_list.rds')
+#all_deg_results
 # ================================================================
 # 步骤 5：功能富集分析（GO / KEGG / GSEA 均过滤 ENSG）
 # ================================================================
