@@ -512,7 +512,8 @@ saveRDS(all_deg_results, file = save_path)
 
 message(sprintf("✅ 变量已成功存储至: %s", save_path))
 
-
+all_deg_results=readRDS('/mnt2/wanggd_group/zjj/Part/DiabeticNeuralgia/scRNA_PBMC_DPN/Output/DPN_Analysis/03_DEG/260513_all_deg_results_list.rds')
+#all_deg_results
 
 # ================================================================
 # Step 4: Key Gene Identification
@@ -829,119 +830,900 @@ message("\n  Step 4 complete!")
 
 
 
-load('/mnt2/wanggd_group/zjj/Part/DiabeticNeuralgia/scRNA_PBMC_DPN/Output/DPN_Analysis/03_DEG/260513_all_deg_results_list.rds')
+all_deg_results=readRDS('/mnt2/wanggd_group/zjj/Part/DiabeticNeuralgia/scRNA_PBMC_DPN/Output/DPN_Analysis/03_DEG/260513_all_deg_results_list.rds')
 #all_deg_results
 # ================================================================
 # 步骤 5：功能富集分析（GO / KEGG / GSEA 均过滤 ENSG）
 # ================================================================
-message("\n===== Step 5: Functional Enrichment Analysis =====")
+# ================================================================
+# Step 5: GO / KEGG Enrichment Analysis by Cell Type
+# ================================================================
+message("\n===== Step 5: Pathway Enrichment Analysis =====")
 
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(enrichplot)
-library(msigdbr)
+library(dplyr)
+library(ggplot2)
 
+# 输出目录
+pathway_dir <- file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway")
+dir.create(pathway_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 检查对象
+all_deg_df <- bind_rows(all_deg_results) %>%
+  filter(!grepl("^ENSG", gene))
+
+if (!exists("all_deg_df")) {
+  stop("all_deg_df not found! Please run DEG analysis first.")
+}
+
+sig_deg <- all_deg_df %>%
+  filter(direction != "NS",
+         !grepl("^ENSG", gene))
+
+cell_types_use <- unique(sig_deg$cell_type)
+
+message(sprintf("  Cell types for enrichment: %d", length(cell_types_use)))
+message(paste(cell_types_use, collapse = ", "))
+
+
+sig_deg <- all_deg_df %>% filter(direction != "NS")
+
+
+up_genes_per_ct <- sig_deg %>%
+  filter(
+    direction == "Up in DPN",
+    !grepl("^ENSG", gene)  # 过滤ENSG编号基因
+  ) %>%
+  group_by(gene) %>%
+  summarise(
+    n_celltypes = n_distinct(cell_type),  # 该基因在多少种细胞类型中上调
+    cell_types  = paste(cell_type, collapse = "; "),  # 列出所有细胞类型
+    mean_log2FC = mean(avg_log2FC),  # 平均log2倍数变化
+    min_padj    = min(p_val_adj),  # 最小校正p值
+    .groups = "drop"
+  ) %>%
+  filter(n_celltypes >= 2) %>%  # 只保留在至少2种细胞类型中上调的基因
+  arrange(desc(n_celltypes), desc(mean_log2FC))  # 按细胞类型数和倍数变化排序
+
+# ==============================================
+# 跨细胞类型下调基因统计（DPN中低表达）
+# ==============================================
+dn_genes_per_ct <- sig_deg %>%
+  filter(
+    direction == "Down in DPN",
+    !grepl("^ENSG", gene)
+  ) %>%
+  group_by(gene) %>%
+  summarise(
+    n_celltypes = n_distinct(cell_type),
+    cell_types  = paste(cell_type, collapse = "; "),
+    mean_log2FC = mean(avg_log2FC),
+    min_padj    = min(p_val_adj),
+    .groups = "drop"
+  ) %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(desc(n_celltypes), desc(abs(mean_log2FC)))  # 下调基因按绝对值排序
+
+message(sprintf("  Multi-celltype UP   genes (>=2 types): %d",
+                nrow(up_genes_per_ct)))
+message(sprintf("  Multi-celltype DOWN genes (>=2 types): %d",
+                nrow(dn_genes_per_ct)))
+
+
+
+
+
+# 保存所有富集结果
 enrich_results <- list()
 
-for (ct in names(all_deg_results)) {
-
-  message(sprintf("  Enrichment for: %s", ct))
-  deg_ct <- all_deg_results[[ct]] %>%
-    filter(!grepl("^ENSG", gene))   # ★ 富集输入过滤
-
-  up_genes <- deg_ct %>% filter(direction == "Up in DPN")   %>% pull(gene)
-  dn_genes <- deg_ct %>% filter(direction == "Down in DPN") %>% pull(gene)
-
-  run_enrichment <- function(genes) {
-    if (length(genes) < 5) return(NULL)
-
-    # GO
-    go_res <- tryCatch(
-      enrichGO(gene          = genes,
-                OrgDb         = org.Hs.eg.db,
-                keyType       = "SYMBOL",
-                ont           = "BP",
-                pAdjustMethod = "BH",
-                pvalueCutoff  = 0.05,
-                qvalueCutoff  = 0.2),
-      error = function(e) NULL
-    )
-
-    # KEGG
-    gene_ids  <- bitr(genes, fromType = "SYMBOL",
-                      toType = "ENTREZID", OrgDb = org.Hs.eg.db)
-    kegg_res <- tryCatch(
-      enrichKEGG(gene          = gene_ids$ENTREZID,
-                  organism      = "hsa",
-                  pAdjustMethod = "BH",
-                  pvalueCutoff  = 0.05),
-      error = function(e) NULL
-    )
-
-    list(GO = go_res, KEGG = kegg_res)
+# ------------------------------------------------
+# 富集函数
+# ------------------------------------------------
+run_enrichment <- function(genes,
+                           min_genes = 10,
+                           p_cutoff = 0.05,
+                           q_cutoff = 0.2) {
+  
+  genes <- unique(genes)
+  genes <- genes[!is.na(genes)]
+  genes <- genes[!grepl("^ENSG", genes)]
+  
+  if (length(genes) < min_genes) {
+    message(sprintf("    Too few genes for enrichment: %d genes", length(genes)))
+    return(list(GO_BP = NULL, GO_MF = NULL, GO_CC = NULL, KEGG = NULL))
   }
+  
+  # SYMBOL -> ENTREZID
+  gene_ids <- tryCatch({
+    bitr(
+      genes,
+      fromType = "SYMBOL",
+      toType   = "ENTREZID",
+      OrgDb    = org.Hs.eg.db
+    )
+  }, error = function(e) {
+    message("    bitr error: ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(gene_ids) || nrow(gene_ids) == 0) {
+    message("    No genes could be converted to ENTREZID.")
+    return(list(GO_BP = NULL, GO_MF = NULL, GO_CC = NULL, KEGG = NULL))
+  }
+  
+  gene_ids <- gene_ids %>%
+    filter(!is.na(ENTREZID)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+  
+  entrez_genes <- unique(gene_ids$ENTREZID)
+  
+  if (length(entrez_genes) < min_genes) {
+    message(sprintf("    Too few converted genes: %d ENTREZ IDs", length(entrez_genes)))
+    return(list(GO_BP = NULL, GO_MF = NULL, GO_CC = NULL, KEGG = NULL))
+  }
+  
+  # GO BP
+  go_bp <- tryCatch({
+    enrichGO(
+      gene          = entrez_genes,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = p_cutoff,
+      qvalueCutoff  = q_cutoff,
+      readable      = TRUE
+    )
+  }, error = function(e) {
+    message("    GO BP error: ", e$message)
+    return(NULL)
+  })
+  
+  # GO MF
+  go_mf <- tryCatch({
+    enrichGO(
+      gene          = entrez_genes,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "MF",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = p_cutoff,
+      qvalueCutoff  = q_cutoff,
+      readable      = TRUE
+    )
+  }, error = function(e) {
+    message("    GO MF error: ", e$message)
+    return(NULL)
+  })
+  
+  # GO CC
+  go_cc <- tryCatch({
+    enrichGO(
+      gene          = entrez_genes,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "CC",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = p_cutoff,
+      qvalueCutoff  = q_cutoff,
+      readable      = TRUE
+    )
+  }, error = function(e) {
+    message("    GO CC error: ", e$message)
+    return(NULL)
+  })
+  
+  # KEGG
+  kegg_res <- tryCatch({
+    enrichKEGG(
+      gene          = entrez_genes,
+      organism      = "hsa",
+      keyType       = "kegg",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = p_cutoff,
+      qvalueCutoff  = q_cutoff
+    )
+  }, error = function(e) {
+    message("    KEGG error: ", e$message)
+    return(NULL)
+  })
+  
+  # KEGG 转换成 SYMBOL，方便查看
+  if (!is.null(kegg_res) && nrow(as.data.frame(kegg_res)) > 0) {
+    kegg_res <- tryCatch({
+      setReadable(kegg_res, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    }, error = function(e) {
+      kegg_res
+    })
+  }
+  
+  return(list(
+    GO_BP = go_bp,
+    GO_MF = go_mf,
+    GO_CC = go_cc,
+    KEGG  = kegg_res
+  ))
+}
 
+# ------------------------------------------------
+# 按 cell type 循环富集
+# ------------------------------------------------
+for (ct in cell_types_use) {
+  
+  message(sprintf("\n  Processing enrichment for: %s", ct))
+  
+  ct_safe <- gsub("[/ +]", "_", ct)
+  
+  up_genes <- sig_deg %>%
+    filter(cell_type == ct,
+           direction == "Up in DPN") %>%
+    pull(gene) %>%
+    unique()
+  
+  dn_genes <- sig_deg %>%
+    filter(cell_type == ct,
+           direction == "Down in DPN") %>%
+    pull(gene) %>%
+    unique()
+  
+  message(sprintf("    Up genes: %d", length(up_genes)))
+  message(sprintf("    Down genes: %d", length(dn_genes)))
+  
   enrich_up <- run_enrichment(up_genes)
   enrich_dn <- run_enrichment(dn_genes)
-  enrich_results[[ct]] <- list(up = enrich_up, down = enrich_dn)
-
-  ct_safe <- gsub("[/ +]", "_", ct)
-
-  if (!is.null(enrich_up$GO) && nrow(enrich_up$GO) > 0) {
-    p_go <- dotplot(enrich_up$GO, showCategory = 20) +
-      ggtitle(paste0(ct, " - GO:BP Up in DPN"))
-    ggsave(file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway",
-                     paste0(date_tag, "_GO_Up_", ct_safe, ".png")),
-           plot = p_go, width = 10, height = 8, dpi = 300)
-    write.csv(as.data.frame(enrich_up$GO),
-              file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway",
-                        paste0(date_tag, "_GO_Up_", ct_safe, ".csv")),
-              row.names = FALSE)
-  }
-
-  if (!is.null(enrich_up$KEGG) && nrow(enrich_up$KEGG) > 0) {
-    p_kegg <- barplot(enrich_up$KEGG, showCategory = 15) +
-      ggtitle(paste0(ct, " - KEGG Up in DPN"))
-    ggsave(file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway",
-                     paste0(date_tag, "_KEGG_Up_", ct_safe, ".png")),
-           plot = p_kegg, width = 10, height = 7, dpi = 300)
-  }
-}
-
-# ---- GSEA（Hallmark）----
-msig_h <- msigdbr(species = "Homo sapiens", category = "H")
-
-for (ct in names(all_deg_results)) {
-
-  deg_ct <- all_deg_results[[ct]] %>%
-    filter(!grepl("^ENSG", gene),        # ★ GSEA 输入过滤
-           !is.na(log2FoldChange))
-
-  gene_list <- setNames(deg_ct$log2FoldChange, deg_ct$gene)
-  gene_list <- sort(gene_list, decreasing = TRUE)
-
-  ct_safe <- gsub("[/ +]", "_", ct)
-
-  gsea_h <- tryCatch(
-    GSEA(gene_list,
-          TERM2GENE    = msig_h[, c("gs_name", "gene_symbol")],
-          pvalueCutoff = 0.25, verbose = FALSE),
-    error = function(e) NULL
+  
+  enrich_results[[ct]] <- list(
+    up   = enrich_up,
+    down = enrich_dn
   )
+  
+  # -------------------------------
+  # 内部函数：保存富集结果和图片
+  # -------------------------------
+  save_enrich_result <- function(enrich_obj, prefix, title_prefix) {
+  
+    if (is.null(enrich_obj)) return(NULL)
+  
+  enrich_df <- as.data.frame(enrich_obj)
+  
+  if (nrow(enrich_df) == 0) {
+    message(sprintf("    No enriched terms for %s", prefix))
+    return(NULL)
+  }
+  
+  # 保存 CSV
+  write.csv(
+    enrich_df,
+    file.path(pathway_dir, paste0(date_tag, "_", prefix, "_", ct_safe, ".csv")),
+    row.names = FALSE
+  )
+  
+  # Dotplot
+  p_dot <- dotplot(enrich_obj, showCategory = 20) +
+    ggtitle(title_prefix) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  ggsave(
+    file.path(pathway_dir, paste0(date_tag, "_", prefix, "_Dotplot_", ct_safe, ".png")),
+    plot = p_dot,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  
+  # Barplot
+  p_bar <- barplot(enrich_obj, showCategory = 20) +
+    ggtitle(title_prefix) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  ggsave(
+    file.path(pathway_dir, paste0(date_tag, "_", prefix, "_Barplot_", ct_safe, ".png")),
+    plot = p_bar,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  }  
+  # Up in DPN
+  save_enrich_result(
+    enrich_up$GO_BP,
+    prefix       = "GO_BP_Up",
+    title_prefix = paste0(ct, " - GO BP: Up in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_up$GO_MF,
+    prefix       = "GO_MF_Up",
+    title_prefix = paste0(ct, " - GO MF: Up in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_up$GO_CC,
+    prefix       = "GO_CC_Up",
+    title_prefix = paste0(ct, " - GO CC: Up in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_up$KEGG,
+    prefix       = "KEGG_Up",
+    title_prefix = paste0(ct, " - KEGG: Up in DPN")
+  )
+  
+  # Down in DPN
+  save_enrich_result(
+    enrich_dn$GO_BP,
+    prefix       = "GO_BP_Down",
+    title_prefix = paste0(ct, " - GO BP: Down in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_dn$GO_MF,
+    prefix       = "GO_MF_Down",
+    title_prefix = paste0(ct, " - GO MF: Down in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_dn$GO_CC,
+    prefix       = "GO_CC_Down",
+    title_prefix = paste0(ct, " - GO CC: Down in DPN")
+  )
+  
+  save_enrich_result(
+    enrich_dn$KEGG,
+    prefix       = "KEGG_Down",
+    title_prefix = paste0(ct, " - KEGG: Down in DPN")
+  )
+}
 
-  if (!is.null(gsea_h) && nrow(gsea_h) > 0) {
-    p_gsea <- dotplot(gsea_h, x = "NES", showCategory = 15,
-                       title = paste0(ct, " - Hallmark GSEA"))
-    ggsave(file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway",
-                     paste0(date_tag, "_GSEA_Hallmark_", ct_safe, ".png")),
-           plot = p_gsea, width = 10, height = 8, dpi = 300)
-    write.csv(as.data.frame(gsea_h),
-              file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway",
-                        paste0(date_tag, "_GSEA_Hallmark_", ct_safe, ".csv")),
-              row.names = FALSE)
+message("\n  Enrichment analysis finished.")
+
+
+# ================================================================
+# Step 5.2: Enrichment for shared multi-celltype DEGs
+# ================================================================
+message("\n===== Step 5.2: Shared DEG Enrichment =====")
+
+shared_up_genes <- up_genes_per_ct$gene
+shared_dn_genes <- dn_genes_per_ct$gene
+
+message(sprintf("  Shared Up genes: %d", length(shared_up_genes)))
+message(sprintf("  Shared Down genes: %d", length(shared_dn_genes)))
+
+shared_enrich_up <- run_enrichment(shared_up_genes)
+shared_enrich_dn <- run_enrichment(shared_dn_genes)
+
+# 保存函数
+save_shared_enrich <- function(enrich_obj, prefix, title_text) {
+  
+  if (is.null(enrich_obj)) return(NULL)
+  
+  enrich_df <- as.data.frame(enrich_obj)
+  
+  if (nrow(enrich_df) == 0) {
+    message(sprintf("  No enriched terms for %s", prefix))
+    return(NULL)
+  }
+  
+  write.csv(
+    enrich_df,
+    file.path(pathway_dir, paste0(date_tag, "_Shared_", prefix, ".csv")),
+    row.names = FALSE
+  )
+  
+  p_dot <- enrichplot::dotplot(enrich_obj, showCategory = 20) +
+    ggtitle(title_text) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  ggsave(
+    file.path(pathway_dir, paste0(date_tag, "_Shared_", prefix, "_Dotplot.png")),
+    plot = p_dot,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+
+# Shared Up
+save_shared_enrich(
+  shared_enrich_up$GO_BP,
+  "GO_BP_Up",
+  "Shared Up Genes - GO BP"
+)
+
+save_shared_enrich(
+  shared_enrich_up$KEGG,
+  "KEGG_Up",
+  "Shared Up Genes - KEGG"
+)
+
+# Shared Down
+save_shared_enrich(
+  shared_enrich_dn$GO_BP,
+  "GO_BP_Down",
+  "Shared Down Genes - GO BP"
+)
+
+save_shared_enrich(
+  shared_enrich_dn$KEGG,
+  "KEGG_Down",
+  "Shared Down Genes - KEGG"
+)
+
+# ================================================================
+# Step 5.3: GSEA GO-BP by Cell Type
+# ================================================================
+message("\n===== Step 5.3: GSEA GO-BP Analysis =====")
+
+gsea_dir <- file.path(projectPath, "Output", "DPN_Analysis", "05_Pathway", "GSEA")
+dir.create(gsea_dir, recursive = TRUE, showWarnings = FALSE)
+
+run_gsea_go <- function(deg_df_ct) {
+  
+  deg_df_ct <- deg_df_ct %>%
+    filter(!is.na(avg_log2FC),
+           !grepl("^ENSG", gene)) %>%
+    arrange(desc(avg_log2FC))
+  
+  gene_map <- bitr(
+    deg_df_ct$gene,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Hs.eg.db
+  )
+  
+  deg_mapped <- deg_df_ct %>%
+    inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+    filter(!is.na(ENTREZID)) %>%
+    group_by(ENTREZID) %>%
+    summarise(avg_log2FC = mean(avg_log2FC), .groups = "drop")
+  
+  gene_list <- deg_mapped$avg_log2FC
+  names(gene_list) <- deg_mapped$ENTREZID
+  
+  gene_list <- sort(gene_list, decreasing = TRUE)
+  
+  if (length(gene_list) < 100) {
+    message("    Too few genes for GSEA.")
+    return(NULL)
+  }
+  
+  gsea_res <- tryCatch({
+    gseGO(
+      geneList     = gene_list,
+      OrgDb        = org.Hs.eg.db,
+      keyType      = "ENTREZID",
+      ont          = "BP",
+      minGSSize    = 10,
+      maxGSSize    = 500,
+      pvalueCutoff = 0.05,
+      verbose      = FALSE
+    )
+  }, error = function(e) {
+    message("    GSEA error: ", e$message)
+    return(NULL)
+  })
+  
+  if (!is.null(gsea_res) && nrow(as.data.frame(gsea_res)) > 0) {
+    gsea_res <- setReadable(gsea_res, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+  
+  return(gsea_res)
+}
+
+
+# ================================================================
+# Step 5.3 (续): 按细胞类型循环运行 GSEA 并保存结果
+# ================================================================
+
+gsea_results <- list()
+
+for (ct in cell_types_use) {
+  
+  message(sprintf("\n  Running GSEA GO-BP for: %s", ct))
+  ct_safe <- gsub("[/ +]", "_", ct)
+  
+  # 提取该细胞类型的全部 DEG（不限方向，GSEA 需要完整排名列表）
+  deg_ct <- all_deg_df %>%
+    filter(cell_type == ct)
+  
+  message(sprintf("    Total genes in ranked list: %d", nrow(deg_ct)))
+  
+  # 运行 GSEA
+  gsea_res <- run_gsea_go(deg_ct)
+  gsea_results[[ct]] <- gsea_res
+  
+  if (is.null(gsea_res)) {
+    message(sprintf("    ⚠️ No GSEA results for %s, skipping.", ct))
+    next
+  }
+  
+  gsea_df <- as.data.frame(gsea_res)
+  
+  if (nrow(gsea_df) == 0) {
+    message(sprintf("    No significant GSEA terms for %s.", ct))
+    next
+  }
+  
+  message(sprintf("    ✅ Significant GSEA terms: %d", nrow(gsea_df)))
+  
+  # ---------------------------
+  # 保存 CSV
+  # ---------------------------
+  write.csv(
+    gsea_df,
+    file.path(gsea_dir, paste0(date_tag, "_GSEA_GO_BP_", ct_safe, ".csv")),
+    row.names = FALSE
+  )
+  
+  # ---------------------------
+  # 图1: Dotplot（按 NES 着色）
+  # ---------------------------
+  n_show <- min(20, nrow(gsea_df))
+  
+  p_dot <- dotplot(gsea_res, showCategory = n_show, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    ggtitle(paste0(ct, " - GSEA GO-BP Dotplot")) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.y = element_text(size = 8)
+    )
+  
+  ggsave(
+    file.path(gsea_dir, paste0(date_tag, "_GSEA_Dotplot_", ct_safe, ".png")),
+    plot = p_dot,
+    width = 12, height = 8, dpi = 300
+  )
+  
+  # ---------------------------
+  # 图2: Ridgeplot（密度脊线图）
+  # ---------------------------
+  p_ridge <- tryCatch({
+    ridgeplot(gsea_res, showCategory = min(15, nrow(gsea_df))) +
+      ggtitle(paste0(ct, " - GSEA GO-BP Ridgeplot")) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.y = element_text(size = 8)
+      )
+  }, error = function(e) {
+    message("    Ridgeplot error: ", e$message)
+    NULL
+  })
+  
+  if (!is.null(p_ridge)) {
+    ggsave(
+      file.path(gsea_dir, paste0(date_tag, "_GSEA_Ridgeplot_", ct_safe, ".png")),
+      plot = p_ridge,
+      width = 10, height = 8, dpi = 300
+    )
+  }
+  
+  # ---------------------------
+  # 图3: 经典 GSEA Running Score Plot（Top 3 通路）
+  # ---------------------------
+  top_ids <- gsea_df %>%
+    arrange(p.adjust) %>%
+    head(3) %>%
+    pull(ID)
+  
+  for (i in seq_along(top_ids)) {
+    p_gsea <- tryCatch({
+      gseaplot2(
+        gsea_res,
+        geneSetID = top_ids[i],
+        title = paste0(ct, "\n", gsea_df$Description[gsea_df$ID == top_ids[i]]),
+        pvalue_table = TRUE
+      )
+    }, error = function(e) {
+      message(sprintf("    gseaplot2 error for %s: %s", top_ids[i], e$message))
+      NULL
+    })
+    
+    if (!is.null(p_gsea)) {
+      ggsave(
+        file.path(gsea_dir, paste0(date_tag, "_GSEA_RunningScore_", ct_safe, "_Top", i, ".png")),
+        plot = p_gsea,
+        width = 8, height = 6, dpi = 300
+      )
+    }
+  }
+  
+  # ---------------------------
+  # 图4: 多通路合并 Running Score（Top 5）
+  # ---------------------------
+  top5_ids <- gsea_df %>%
+    arrange(p.adjust) %>%
+    head(min(5, nrow(gsea_df))) %>%
+    pull(ID)
+  
+  if (length(top5_ids) >= 2) {
+    p_multi <- tryCatch({
+      gseaplot2(
+        gsea_res,
+        geneSetID = top5_ids,
+        pvalue_table = FALSE,
+        title = paste0(ct, " - Top GSEA Pathways")
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(p_multi)) {
+      ggsave(
+        file.path(gsea_dir, paste0(date_tag, "_GSEA_MultiPath_", ct_safe, ".png")),
+        plot = p_multi,
+        width = 10, height = 7, dpi = 300
+      )
+    }
   }
 }
 
+# ================================================================
+# Step 5.3.2: 汇总所有细胞类型的 GSEA 结果
+# ================================================================
+
+# ================================================================
+# Step 5.3 (续): 按细胞类型循环运行 GSEA 并保存结果
+# ================================================================
+
+gsea_results <- list()
+
+for (ct in cell_types_use) {
+  
+  message(sprintf("\n  Running GSEA GO-BP for: %s", ct))
+  ct_safe <- gsub("[/ +]", "_", ct)
+  
+  # 提取该细胞类型的全部 DEG（不限方向，GSEA 需要完整排名列表）
+  deg_ct <- all_deg_df %>%
+    filter(cell_type == ct)
+  
+  message(sprintf("    Total genes in ranked list: %d", nrow(deg_ct)))
+  
+  # 运行 GSEA
+  gsea_res <- run_gsea_go(deg_ct)
+  gsea_results[[ct]] <- gsea_res
+  
+  if (is.null(gsea_res)) {
+    message(sprintf("    ⚠️ No GSEA results for %s, skipping.", ct))
+    next
+  }
+  
+  gsea_df <- as.data.frame(gsea_res)
+  
+  if (nrow(gsea_df) == 0) {
+    message(sprintf("    No significant GSEA terms for %s.", ct))
+    next
+  }
+  
+  message(sprintf("    ✅ Significant GSEA terms: %d", nrow(gsea_df)))
+  
+  # ---------------------------
+  # 保存 CSV
+  # ---------------------------
+  write.csv(
+    gsea_df,
+    file.path(gsea_dir, paste0(date_tag, "_GSEA_GO_BP_", ct_safe, ".csv")),
+    row.names = FALSE
+  )
+  
+  # ---------------------------
+  # 图1: Dotplot（按 NES 着色）
+  # ---------------------------
+  n_show <- min(20, nrow(gsea_df))
+  
+  p_dot <- dotplot(gsea_res, showCategory = n_show, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    ggtitle(paste0(ct, " - GSEA GO-BP Dotplot")) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.y = element_text(size = 8)
+    )
+  
+  ggsave(
+    file.path(gsea_dir, paste0(date_tag, "_GSEA_Dotplot_", ct_safe, ".png")),
+    plot = p_dot,
+    width = 12, height = 8, dpi = 300
+  )
+  
+  # ---------------------------
+  # 图2: Ridgeplot（密度脊线图）
+  # ---------------------------
+  p_ridge <- tryCatch({
+    ridgeplot(gsea_res, showCategory = min(15, nrow(gsea_df))) +
+      ggtitle(paste0(ct, " - GSEA GO-BP Ridgeplot")) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.y = element_text(size = 8)
+      )
+  }, error = function(e) {
+    message("    Ridgeplot error: ", e$message)
+    NULL
+  })
+  
+  if (!is.null(p_ridge)) {
+    ggsave(
+      file.path(gsea_dir, paste0(date_tag, "_GSEA_Ridgeplot_", ct_safe, ".png")),
+      plot = p_ridge,
+      width = 10, height = 8, dpi = 300
+    )
+  }
+  
+  # ---------------------------
+  # 图3: 经典 GSEA Running Score Plot（Top 3 通路）
+  # ---------------------------
+  top_ids <- gsea_df %>%
+    arrange(p.adjust) %>%
+    head(3) %>%
+    pull(ID)
+  
+  for (i in seq_along(top_ids)) {
+    p_gsea <- tryCatch({
+      gseaplot2(
+        gsea_res,
+        geneSetID = top_ids[i],
+        title = paste0(ct, "\n", gsea_df$Description[gsea_df$ID == top_ids[i]]),
+        pvalue_table = TRUE
+      )
+    }, error = function(e) {
+      message(sprintf("    gseaplot2 error for %s: %s", top_ids[i], e$message))
+      NULL
+    })
+    
+    if (!is.null(p_gsea)) {
+      ggsave(
+        file.path(gsea_dir, paste0(date_tag, "_GSEA_RunningScore_", ct_safe, "_Top", i, ".png")),
+        plot = p_gsea,
+        width = 8, height = 6, dpi = 300
+      )
+    }
+  }
+  # ---------------------------
+  # 图4: 多通路合并 Running Score（Top 5）
+  # ---------------------------
+  top5_ids <- gsea_df %>%
+    arrange(p.adjust) %>%
+    head(min(5, nrow(gsea_df))) %>%
+    pull(ID)
+  
+  if (length(top5_ids) >= 2) {
+    p_multi <- tryCatch({
+      gseaplot2(
+        gsea_res,
+        geneSetID = top5_ids,
+        pvalue_table = FALSE,
+        title = paste0(ct, " - Top GSEA Pathways")
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(p_multi)) {
+      ggsave(
+        file.path(gsea_dir, paste0(date_tag, "_GSEA_MultiPath_", ct_safe, ".png")),
+        plot = p_multi,
+        width = 10, height = 7, dpi = 300
+      )
+    }
+  }
+}
+# ================================================================
+# Step 5.3.2: 汇总所有细胞类型的 GSEA 结果（稳健版）
+# ================================================================
+message("\n  Combining all GSEA results...")
+all_gsea_df <- data.frame()
+for (ct in names(gsea_results)) {
+  res <- gsea_results[[ct]]
+  if (!is.null(res)) {
+    res_df <- as.data.frame(res)
+    if (nrow(res_df) > 0) {
+      res_df$cell_type <- ct
+      all_gsea_df <- rbind(all_gsea_df, res_df)
+    }
+  }
+}
+if (nrow(all_gsea_df) > 0) {
+  write.csv(
+    all_gsea_df,
+    file.path(gsea_dir, paste0(date_tag, "_GSEA_GO_BP_AllCellTypes_Combined.csv")),
+    row.names = FALSE
+  )
+  message(sprintf(
+    "  ✅ Combined GSEA table saved: %d terms across %d cell types.",
+    nrow(all_gsea_df),
+    length(unique(all_gsea_df$cell_type))
+  ))
+  # ------------------------------------------------
+  # 选取多个细胞类型中都显著的通路
+  # ------------------------------------------------
+  pathway_counts <- all_gsea_df %>%
+    dplyr::filter(!is.na(p.adjust), p.adjust < 0.05) %>%
+    dplyr::group_by(Description) %>%
+    dplyr::summarise(
+      n_ct = dplyr::n_distinct(cell_type),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(n_ct >= 2) %>%
+    dplyr::arrange(dplyr::desc(n_ct))
+  if (nrow(pathway_counts) > 0) {
+    top_shared_pathways <- pathway_counts %>%
+      head(min(30, nrow(pathway_counts))) %>%
+      dplyr::pull(Description)
+    # ------------------------------------------------
+    # 构建 NES 热图矩阵
+    # ------------------------------------------------
+  heatmap_data <- all_gsea_df %>%
+    dplyr::filter(Description %in% top_shared_pathways) %>%
+    dplyr::select(Description, cell_type, NES) %>%
+    dplyr::mutate(NES = as.numeric(NES)) %>%
+    dplyr::group_by(Description, cell_type) %>%
+    dplyr::summarise(NES = mean(NES, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(
+      names_from = cell_type,
+      values_from = NES
+    ) %>%
+  tibble::column_to_rownames("Description")
+    heatmap_mat <- as.matrix(heatmap_data)
+    mode(heatmap_mat) <- "numeric"
+    # ------------------------------------------------
+    # 清理 NA/Inf，避免 pheatmap 报错
+    # 规则：
+    # 1) 去掉全 NA 的行
+    # 2) 去掉方差为 0 的行
+    # 3) 保留至少 2 个非 NA 值的通路
+    # ------------------------------------------------
+    heatmap_mat <- heatmap_mat[rowSums(!is.na(heatmap_mat)) >= 2, , drop = FALSE]
+    if (nrow(heatmap_mat) > 0 && ncol(heatmap_mat) > 1) {
+      
+      # 对剩余 NA 做行均值填充
+      for (i in seq_len(nrow(heatmap_mat))) {
+        row_vals <- heatmap_mat[i, ]
+        if (any(is.na(row_vals))) {
+          row_mean <- mean(row_vals, na.rm = TRUE)
+          if (is.finite(row_mean)) {
+            row_vals[is.na(row_vals)] <- row_mean
+            heatmap_mat[i, ] <- row_vals
+          }
+        }
+      }
+      # 再次去掉仍然有问题的行
+      heatmap_mat <- heatmap_mat[is.finite(rowMeans(heatmap_mat)), , drop = FALSE]
+      heatmap_mat <- heatmap_mat[apply(heatmap_mat, 1, sd, na.rm = TRUE) > 0, , drop = FALSE]
+      if (nrow(heatmap_mat) > 1 && ncol(heatmap_mat) > 1) {
+        if (requireNamespace("pheatmap", quietly = TRUE)) {
+          library(pheatmap)
+          png(
+            file.path(gsea_dir, paste0(date_tag, "_GSEA_NES_Heatmap_SharedPathways.png")),
+            width = 12,
+            height = 10,
+            units = "in",
+            res = 300
+          )
+          pheatmap::pheatmap(
+            heatmap_mat,
+            cluster_rows = TRUE,
+            cluster_cols = TRUE,
+            color = colorRampPalette(c("blue", "white", "red"))(100),
+            na_col = "grey90",
+            main = "GSEA NES - Shared Pathways Across Cell Types",
+            fontsize_row = 7,
+            fontsize_col = 9,
+            border_color = NA
+          )
+          dev.off()
+          message("  ✅ NES Heatmap saved.")
+        }
+      }
+    }
+  }
+}
+message("\n===== Step 5.3 GSEA Analysis Complete =====")message("\n===== Step 5.3 GSEA Analysis Complete =====")
+
+
+
+                        
 
 # ================================================================
 # 步骤 6：细胞间通讯分析（CellChat）
